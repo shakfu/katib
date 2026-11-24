@@ -4,16 +4,21 @@
 use std::{
     collections::HashMap,
     ops::Range,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
 use gpui_kit::{
     base::text::editor_host::{FlowPosition, LeafGeometry, RenderContext, collect_leaf_geometry},
     component::{ActiveTheme as _, v_flex},
+    prelude::FluentBuilder as _,
     *,
 };
 
-use katib_core::Link;
+use katib_core::{
+    Link, Suggestion,
+    complete::{completion_edit, wiki_query},
+};
 
 use crate::{Document, Projection, project};
 
@@ -41,8 +46,21 @@ actions!(
         Paste,
         Undo,
         Redo,
+        AcceptCompletion,
+        Dismiss,
     ]
 );
+
+/// Notes to offer for the wiki reference typed so far.
+pub type Completer = Rc<dyn Fn(&str) -> Vec<Suggestion>>;
+
+/// The open completion menu.
+struct Completion {
+    /// Just after the `[[`.
+    start: usize,
+    items: Vec<Suggestion>,
+    selected: usize,
+}
 
 /// What the editor reports to its owner.
 #[derive(Clone, Debug)]
@@ -51,6 +69,10 @@ pub enum EditorEvent {
     Changed,
     /// A link was cmd-clicked (ctrl-clicked off macOS).
     OpenLink(Link),
+    /// An image was pasted: its bytes and a file extension for its format.
+    PasteImage(Vec<u8>, &'static str),
+    /// Files were pasted (copied in a file manager).
+    PasteFiles(Vec<std::path::PathBuf>),
 }
 
 /// Edits further apart than this are separate undo steps.
@@ -101,6 +123,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(paste, Paste, c),
         KeyBinding::new(undo, Undo, c),
         KeyBinding::new(redo, Redo, c),
+        KeyBinding::new("tab", AcceptCompletion, c),
+        KeyBinding::new("escape", Dismiss, c),
     ]);
 }
 
@@ -127,6 +151,10 @@ pub struct LiveEditor {
     /// Scroll the caret into view on the next frame.
     autoscroll: bool,
     last_edit: Option<Instant>,
+    completer: Option<Completer>,
+    completion: Option<Completion>,
+    /// The caret from the last prepaint, in window coordinates; anchors the menu.
+    caret: Option<Bounds<Pixels>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -136,7 +164,10 @@ impl LiveEditor {
         // Redraw on focus changes: the caret's block shows its markdown only while focused.
         let subscriptions = vec![
             cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
-            cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_blur(&focus, window, |this, _, cx| {
+                this.completion = None;
+                cx.notify();
+            }),
         ];
         Self {
             focus,
@@ -152,7 +183,126 @@ impl LiveEditor {
             scroll: ScrollHandle::new(),
             autoscroll: true,
             last_edit: None,
+            completer: None,
+            completion: None,
+            caret: None,
         }
+    }
+
+    /// Offer notes while a wiki link is typed.
+    pub fn set_completer(&mut self, completer: Completer) {
+        self.completer = Some(completer);
+    }
+
+    /// Open, refresh or close the menu for the reference at the caret.
+    fn update_completion(&mut self) {
+        let head = self.doc.head();
+        let query = self
+            .doc
+            .selection()
+            .is_empty()
+            .then(|| wiki_query(self.doc.text(), head))
+            .flatten();
+        self.completion = match (query, &self.completer) {
+            (Some((start, query)), Some(complete)) => {
+                let items = complete(query);
+                let selected = match &self.completion {
+                    Some(c) if c.start == start => c.selected.min(items.len().saturating_sub(1)),
+                    _ => 0,
+                };
+                (!items.is_empty()).then_some(Completion {
+                    start,
+                    items,
+                    selected,
+                })
+            }
+            _ => None,
+        };
+    }
+
+    /// Write the chosen note's reference and close the link.
+    fn accept_completion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.completion.take() else {
+            return;
+        };
+        let Some(item) = c.items.get(ix) else {
+            return;
+        };
+        let (range, text) =
+            completion_edit(self.doc.text(), c.start, self.doc.head(), &item.reference);
+        self.doc.seal();
+        self.edit(|d| d.replace(Some(range), &text), window, cx);
+        self.doc.seal();
+        self.completion = None;
+    }
+
+    /// Move the menu's selection; `false` when no menu is open.
+    fn select_completion(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(c) = &mut self.completion else {
+            return false;
+        };
+        let n = c.items.len() as isize;
+        c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
+        cx.notify();
+        true
+    }
+
+    fn completion_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let c = self.completion.as_ref()?;
+        let caret = self.caret?;
+        let theme = cx.theme();
+        let rows = c.items.iter().enumerate().map(|(ix, item)| {
+            let selected = ix == c.selected;
+            v_flex()
+                .id(("completion", ix))
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .when(selected, |d| {
+                    d.bg(theme.accent).text_color(theme.accent_foreground)
+                })
+                .child(div().text_sm().child(item.title.clone()))
+                .when(item.id != item.title, |d| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .when(!selected, |d| d.text_color(theme.muted_foreground))
+                            .child(item.id.clone()),
+                    )
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        // The editor under the menu must not move the caret too.
+                        cx.stop_propagation();
+                        this.accept_completion(ix, window, cx);
+                    }),
+                )
+        });
+        let menu = v_flex()
+            .id("completion-menu")
+            .w(px(320.))
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .p_1()
+            .gap_0p5()
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(theme.radius)
+            .shadow_md()
+            .children(rows);
+        Some(
+            deferred(
+                anchored()
+                    .position(point(caret.left(), caret.bottom() + px(4.)))
+                    .child(menu),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     pub fn text(&self) -> &str {
@@ -187,6 +337,28 @@ impl LiveEditor {
         cx.notify();
     }
 
+    /// Draw this note's local images: paths resolve from note `id`'s folder in
+    /// the vault at `root`, and never outside it.
+    pub fn set_note(&mut self, root: std::path::PathBuf, id: String, cx: &mut Context<Self>) {
+        self.context = RenderContext::from_app(cx)
+            .on_link_click(|_, _, _, _| {})
+            .with_image_source(move |uri| {
+                let path = katib_core::paths::relative_path(&id, uri.as_ref()).map_or_else(
+                    || root.join(".katib/outside-the-vault"),
+                    |rel| root.join(rel),
+                );
+                path.into()
+            });
+        cx.notify();
+    }
+
+    /// Insert `text` at the caret, replacing the selection, as one undo step.
+    pub fn insert(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.doc.seal();
+        self.edit(|d| d.replace(None, text), window, cx);
+        self.doc.seal();
+    }
+
     /// Frame timing, for the spike window's status line.
     pub fn stats(&self) -> String {
         let ms = |d: Duration| d.as_secs_f64() * 1000.;
@@ -214,6 +386,7 @@ impl LiveEditor {
         self.goal_x = None;
         self.autoscroll = true;
         window.notify_text_input_changed(&self.focus);
+        self.update_completion();
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
@@ -221,6 +394,10 @@ impl LiveEditor {
     fn moved(&mut self, offset: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.doc.move_to(offset, extend);
         self.doc.seal();
+        // Moving never opens the menu; it follows the caret or closes.
+        if self.completion.is_some() {
+            self.update_completion();
+        }
         self.autoscroll = true;
         window.notify_text_selection_changed(&self.focus);
         cx.notify();
@@ -359,7 +536,50 @@ impl LiveEditor {
         out
     }
 
+    /// The checklist marker whose checkbox is drawn under window point `p`:
+    /// left of the first line of a leaf that starts a checklist item's text.
+    fn checkbox_at(&self, p: Point<Pixels>) -> Option<usize> {
+        // The box is drawn in the item's indent, about one line height wide.
+        let leaf = self.projection.leaves.iter().find_map(|leaf| {
+            let geo = self.geometry.get(&leaf.key)?;
+            let b = geo.bounds();
+            let first_line = p.y >= b.top() && p.y < b.top() + geo.line_height();
+            let in_indent = p.x < b.left() && p.x >= b.left() - geo.line_height() * 2.;
+            (first_line && in_indent).then_some(leaf)
+        })?;
+        let text = self.doc.text();
+        let at = leaf.to_source(0);
+        let line = |o: usize| text[..o].rfind('\n').map_or(0, |i| i + 1);
+        katib_core::parse(text)
+            .items
+            .into_iter()
+            .find(|i| line(i.marker) == line(at) && i.marker < at)
+            .map(|i| i.marker)
+    }
+
+    /// Tick or untick the checklist item at `marker`, as one undo step; the
+    /// caret stays where it was, since the marker keeps its length.
+    fn toggle_item(&mut self, marker: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let done = !self.doc.text()[marker..].starts_with("[ ]");
+        let head = self.doc.head();
+        self.doc.seal();
+        self.edit(
+            |d| {
+                d.replace(Some(marker..marker + 3), if done { "[ ]" } else { "[x]" });
+                d.move_to(head, false);
+            },
+            window,
+            cx,
+        );
+        self.doc.seal();
+    }
+
     fn on_mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Ticking a box is not editing at it: the editor keeps its focus state.
+        if let Some(marker) = self.checkbox_at(e.position) {
+            self.toggle_item(marker, window, cx);
+            return;
+        }
         window.focus(&self.focus, cx);
         if e.modifiers.secondary(cx)
             && let Some(offset) = self.source_at(e.position)
@@ -426,6 +646,7 @@ impl Render for LiveEditor {
             })
             .collect();
         let decorations = self.decorations(cx);
+        let menu = self.completion_menu(cx);
         let theme = cx.theme();
 
         v_flex().size_full().bg(theme.background).child(
@@ -444,10 +665,24 @@ impl Render for LiveEditor {
                     cx.listener(|this, _: &Delete, w, cx| this.edit(Document::delete, w, cx)),
                 )
                 .on_action(
-                    cx.listener(|this, _: &Enter, w, cx| {
-                        this.edit(|d| d.replace(None, "\n"), w, cx)
+                    cx.listener(|this, _: &Enter, w, cx| match &this.completion {
+                        Some(c) => this.accept_completion(c.selected, w, cx),
+                        None => this.edit(|d| d.replace(None, "\n"), w, cx),
                     }),
                 )
+                .on_action(cx.listener(
+                    |this, _: &AcceptCompletion, w, cx| match &this.completion {
+                        Some(c) => this.accept_completion(c.selected, w, cx),
+                        None => cx.propagate(),
+                    },
+                ))
+                .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
+                    if this.completion.take().is_some() {
+                        cx.notify();
+                    } else {
+                        cx.propagate();
+                    }
+                }))
                 .on_action(cx.listener(|this, _: &Undo, w, cx| {
                     if this.doc.undo() {
                         this.changed(w, cx);
@@ -470,8 +705,16 @@ impl Render for LiveEditor {
                 .on_action(
                     cx.listener(|this, _: &SelectRight, w, cx| this.horizontal(true, true, w, cx)),
                 )
-                .on_action(cx.listener(|this, _: &Up, w, cx| this.vertical(false, false, w, cx)))
-                .on_action(cx.listener(|this, _: &Down, w, cx| this.vertical(true, false, w, cx)))
+                .on_action(cx.listener(|this, _: &Up, w, cx| {
+                    if !this.select_completion(-1, cx) {
+                        this.vertical(false, false, w, cx)
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &Down, w, cx| {
+                    if !this.select_completion(1, cx) {
+                        this.vertical(true, false, w, cx)
+                    }
+                }))
                 .on_action(
                     cx.listener(|this, _: &SelectUp, w, cx| this.vertical(false, true, w, cx)),
                 )
@@ -513,10 +756,28 @@ impl Render for LiveEditor {
                     }
                 }))
                 .on_action(cx.listener(|this, _: &Paste, w, cx| {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                        this.doc.seal();
-                        this.edit(|d| d.replace(None, &text), w, cx);
-                        this.doc.seal();
+                    let Some(item) = cx.read_from_clipboard() else {
+                        return;
+                    };
+                    // Files and images become attachments; the owner stores them.
+                    for entry in item.entries() {
+                        match entry {
+                            ClipboardEntry::ExternalPaths(paths) => {
+                                cx.emit(EditorEvent::PasteFiles(paths.paths().to_vec()));
+                                return;
+                            }
+                            ClipboardEntry::Image(image) => {
+                                cx.emit(EditorEvent::PasteImage(
+                                    image.bytes.clone(),
+                                    extension(image.format),
+                                ));
+                                return;
+                            }
+                            ClipboardEntry::String(_) => {}
+                        }
+                    }
+                    if let Some(text) = item.text() {
+                        this.insert(&text, w, cx);
                     }
                 }))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -538,8 +799,23 @@ impl Render for LiveEditor {
                         .py_6()
                         .children(segments)
                         .into_any_element(),
-                }),
+                })
+                .children(menu),
         )
+    }
+}
+
+fn extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Pnm => "pnm",
     }
 }
 
@@ -621,13 +897,17 @@ impl Element for EditorElement {
         let child = &mut self.child;
         let (_, geometry) = collect_leaf_geometry(decorations, || child.prepaint(window, cx));
         let caret_color = cx.theme().caret;
-        self.editor.update(cx, |editor, _| {
+        self.editor.update(cx, |editor, cx| {
             editor.geometry = geometry;
             let head = editor.doc.head();
             let (_, geo, i) = editor.caret_leaf(head)?;
             let at = caret_top(geo, i);
             let caret = Bounds::new(at, size(px(2.), geo.caret_height()));
             let margin = geo.line_height();
+            // The menu was placed from the last frame's caret; redraw once if it moved.
+            if editor.caret.replace(caret) != Some(caret) && editor.completion.is_some() {
+                cx.notify();
+            }
             if std::mem::take(&mut editor.autoscroll) {
                 scroll_into_view(&editor.scroll, caret, margin, window);
             }

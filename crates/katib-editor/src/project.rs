@@ -8,7 +8,7 @@
 use std::ops::Range;
 
 use gpui_kit::base::text::editor_host::{
-    BlockNode, CodeBlock, InlineNode, LinkMark, Paragraph, TextMark,
+    BlockNode, CodeBlock, ImageNode, InlineNode, LinkMark, Paragraph, TextMark,
 };
 use katib_core::LinkKind;
 use katib_core::md::{self, Kind, Node};
@@ -356,6 +356,9 @@ impl Cx<'_> {
                 self.children(&node.children, &link, out);
             }
             Kind::Code(value) => push(out, value, source, src.start, &mark.clone().code()),
+            // Local images are drawn; a remote one stays alt text, since fetching
+            // it would tell its server whenever this note is read.
+            Kind::Image { url, alt } if !has_scheme(url) => push_image(out, url, alt),
             Kind::Image { alt, .. } => push(out, alt, source, src.start, &mark.clone().italic()),
             Kind::Break => push(out, "\n", "\n", src.start, mark),
             _ => push(out, source, source, src.start, mark),
@@ -422,6 +425,26 @@ impl Cx<'_> {
         let rest = &self.text[at..src.end];
         push(out, rest, rest, at, mark);
     }
+}
+
+/// Append an image. It is one atom (`U+FFFC`, 3 bytes) in the leaf, with no
+/// source run, so the caret skips it as it skips hidden markup.
+fn push_image(out: &mut Inline, url: &str, alt: &str) {
+    let mut image = ImageNode::default();
+    image.url = url.to_owned().into();
+    image.alt = (!alt.is_empty()).then(|| alt.to_owned().into());
+    out.para.push(InlineNode::image(image));
+    out.len += '\u{fffc}'.len_utf8();
+}
+
+/// Whether `url` names a scheme (`https:`, `data:`), not a path.
+fn has_scheme(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.len() > 1
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    })
 }
 
 /// Append `value`, drawn from `source` starting at byte `offset`.
@@ -610,5 +633,17 @@ mod tests {
         assert_eq!(shown, [false, false]);
         // With the caret in the heading, the heading shows its markdown.
         assert!(project(text, Some(0)).segments[0].raw);
+    }
+
+    #[test]
+    fn a_local_image_is_one_atom_and_a_remote_one_is_text() {
+        let text = "x\n\na ![p](img/p.png) b ![r](https://x.org/r.png)";
+        let p = project(text, Some(0));
+        let leaf = p.leaves.last().unwrap();
+        // Rendered: "a " + atom (3 bytes) + " b " + "r".
+        assert_eq!(leaf.to_leaf(text.find(" b").unwrap()), Some(5));
+        // The remote image's alt text maps back to where it is written.
+        assert_eq!(leaf.to_source(8), text.find("[r]").unwrap() + 1);
+        assert!(has_scheme("https://x") && !has_scheme("c:/x") && !has_scheme("img/p.png"));
     }
 }

@@ -6,4 +6,4 @@ mod view;
 
 pub use doc::Document;
 pub use project::{LeafMap, Projection, Segment, project};
-pub use view::{EditorEvent, LiveEditor, init};
+pub use view::{Completer, EditorEvent, LiveEditor, init};

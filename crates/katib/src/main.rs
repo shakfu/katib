@@ -1,6 +1,7 @@
 //! katib: a desktop notes app over a folder of markdown files.
 
 mod app;
+mod complete;
 mod pane;
 
 use std::{env, path::PathBuf, process};
@@ -18,9 +19,15 @@ fn main() {
         init(cx);
         katib_editor::init(cx);
         app::bind_keys(cx);
+        app::set_menus(cx);
+        let window_bounds = Some(WindowBounds::centered(None, size(px(1100.), px(760.)), cx));
+        // The window draws its title bar, holding the toolbar (and, off
+        // macOS, the menus). On Linux that needs client-side decorations, or
+        // the compositor adds a title bar of its own.
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(None, size(px(1100.), px(760.)), cx)),
-            ..Default::default()
+            window_bounds,
+            window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
+            ..component::TitleBar::window_options()
         };
         open_window(options, cx, |window, cx| {
             cx.new(|cx| app::Katib::new(vault, index, window, cx))

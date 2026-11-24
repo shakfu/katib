@@ -17,3 +17,6 @@ Cmd-click a link to follow it. The panel under each note lists its backlinks.
 ## Search
 
 Press cmd-p to open a note, search note text, or create a note.
+
+This is the way I would like to let you know that everything is [ok](https://python.org).
+

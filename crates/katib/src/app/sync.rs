@@ -3,17 +3,20 @@
 
 use std::{
     collections::HashMap,
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
+use katib_core::{
+    Vault,
+    config::{Backend, Config},
+};
 use katib_sync::{Choice, Conflicts, Outcome, Repo, Report, Versions};
 
 use super::{Katib, notify_error};
@@ -46,15 +49,29 @@ pub(super) struct SyncState {
 }
 
 impl SyncState {
-    pub(super) fn new(root: &Path) -> Self {
-        let (repo, off) = if !opted_in(root) {
+    pub(super) fn new(vault: &Vault, config: &Config) -> Self {
+        let (repo, off) = if let Some(problem) = &config.problem {
+            (None, Some(format!(".katib/config.toml: {problem}")))
+        } else if !config.sync {
+            // Sync commits and pushes everything in the vault, so it is opt-in:
+            // opening some other repository must not commit it.
             (
                 None,
                 Some("set sync = true in .katib/config.toml".to_owned()),
             )
         } else {
-            match Repo::open(root) {
-                Ok(Some(repo)) => (Some(Arc::new(repo)), None),
+            match Repo::open(vault.root()) {
+                Ok(Some(mut repo)) => match config.backend {
+                    // Without git-lfs, attachments would be committed as plain files.
+                    Backend::Lfs => match katib_core::attach::ensure_lfs_attributes(vault) {
+                        Err(e) => (None, Some(format!(".gitattributes: {e}"))),
+                        Ok(()) => match repo.enable_lfs() {
+                            Ok(()) => (Some(Arc::new(repo)), None),
+                            Err(e) => (None, Some(format!("git-lfs: {e}"))),
+                        },
+                    },
+                    _ => (Some(Arc::new(repo)), None),
+                },
                 Ok(None) => (None, Some("not a git repository".to_owned())),
                 Err(e) => (None, Some(e.to_string())),
             }
@@ -74,6 +91,10 @@ impl SyncState {
             choices: HashMap::new(),
             versions: Vec::new(),
         }
+    }
+
+    pub(super) fn is_busy(&self) -> bool {
+        self.busy
     }
 
     pub(super) fn note_change(&mut self) {
@@ -118,6 +139,9 @@ impl SyncState {
         }
         match &self.report {
             None => "not synced yet".into(),
+            Some(Report {
+                lfs_error: Some(_), ..
+            }) => "synced; some attachments not downloaded".into(),
             Some(r) => match &r.outcome {
                 Outcome::Synced => "synced".into(),
                 Outcome::NoRemote => "no remote; commits stay here".into(),
@@ -129,24 +153,6 @@ impl SyncState {
     }
 }
 
-/// Sync commits and pushes everything in the vault, so it never starts on
-/// its own: a vault opts in with a top-level `sync = true` line in
-/// `.katib/config.toml`. Opening some other repository must not commit it.
-fn opted_in(root: &Path) -> bool {
-    let Ok(config) = std::fs::read_to_string(root.join(".katib/config.toml")) else {
-        return false;
-    };
-    config
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        // Keys after the first `[table]` header belong to that table.
-        .take_while(|l| !l.starts_with('['))
-        .any(|l| {
-            l.split_once('=')
-                .is_some_and(|(k, v)| k.trim() == "sync" && v.trim() == "true")
-        })
-}
-
 impl Katib {
     /// Called twice a second: run a cycle if one is due and every buffer is saved.
     pub(super) fn sync_tick(&mut self, cx: &mut Context<Self>) {
@@ -155,7 +161,7 @@ impl Katib {
             return;
         }
         // An unsaved buffer delays the sync; it is never committed half-way.
-        if self.pane.as_ref().is_some_and(|p| !p.read(cx).is_saved()) {
+        if !self.all_saved(cx) {
             return;
         }
         let commit_due = s.changed && s.last_change.elapsed() >= QUIET;
@@ -212,23 +218,56 @@ impl Katib {
         cx.notify();
     }
 
-    /// The status bar's sync part: text, plus a button while conflicts wait.
+    /// Run a cycle now, as the status bar button and the Sync menu ask.
+    pub(super) fn sync_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(off) = &self.sync.off {
+            return notify_error(window, cx, format!("Sync is off: {off}"));
+        }
+        if self.sync.busy {
+            return;
+        }
+        if self.sync.conflicts().is_some() {
+            return self.open_conflicts(window, cx);
+        }
+        self.save_all(cx);
+        if !self.all_saved(cx) {
+            return notify_error(window, cx, "An open note has unsaved changes".into());
+        }
+        self.run_sync(cx);
+    }
+
+    /// The status bar's sync part: the state, which runs a cycle when clicked,
+    /// plus a button while conflicts wait.
     pub(super) fn sync_status(&self, cx: &mut Context<Self>) -> AnyElement {
-        let text = div().child(self.sync.status());
-        match self.sync.conflicts() {
-            Some(_) => h_flex()
-                .gap_2()
-                .child(text)
-                .child(
+        let icon = match (&self.sync.off, &self.sync.error, self.sync.conflicts()) {
+            (Some(_), ..) => IconName::CircleX,
+            (_, Some(_), _) | (_, _, Some(_)) => IconName::TriangleAlert,
+            _ => IconName::RefreshCw,
+        };
+        let state = Button::new("sync-state")
+            .ghost()
+            .xsmall()
+            .icon(icon)
+            .label(self.sync.status())
+            .loading(self.sync.busy)
+            .tooltip(match &self.sync.off {
+                Some(_) => "Sync is off; see Settings",
+                None => "Sync now",
+            })
+            .on_click(cx.listener(|this, _, w, cx| this.sync_now(w, cx)));
+        h_flex()
+            .gap_1()
+            .child(state)
+            .when(self.sync.conflicts().is_some(), |row| {
+                row.child(
                     Button::new("resolve")
                         .xsmall()
                         .primary()
                         .label("Resolve")
                         .on_click(cx.listener(|this, _, w, cx| this.open_conflicts(w, cx))),
                 )
-                .into_any_element(),
-            None => text.into_any_element(),
-        }
+            })
+            .into_any_element()
     }
 
     fn open_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -366,8 +405,9 @@ impl Katib {
         let (Some(repo), Some(c)) = (self.sync.repo.clone(), self.sync.conflicts().cloned()) else {
             return;
         };
-        if self.pane.as_ref().is_some_and(|p| !p.read(cx).is_saved()) {
-            return notify_error(window, cx, "Save the open note first".into());
+        self.save_all(cx);
+        if !self.all_saved(cx) {
+            return notify_error(window, cx, "Save the open notes first".into());
         }
         let choices: Vec<_> = self
             .sync
@@ -401,31 +441,5 @@ impl Katib {
             });
         })
         .detach();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::opted_in;
-
-    #[test]
-    fn sync_needs_an_explicit_top_level_opt_in() {
-        let dir = std::env::temp_dir().join(format!("katib-optin-{}", std::process::id()));
-        let config = dir.join(".katib/config.toml");
-        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        let check = |text: &str| {
-            std::fs::write(&config, text).unwrap();
-            opted_in(&dir)
-        };
-        assert!(check("sync = true\n"));
-        assert!(check(
-            "# vault\nsync=true # on\n[objects]\nbackend = \"git\"\n"
-        ));
-        assert!(!check("sync = false\n"));
-        assert!(!check("# sync = true\n"));
-        assert!(!check("[objects]\nsync = true\n"));
-        std::fs::remove_file(&config).unwrap();
-        assert!(!opted_in(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

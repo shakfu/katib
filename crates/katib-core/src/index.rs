@@ -9,11 +9,12 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::{
     Link, LinkKind, Vault, VaultError,
     note::{self, Note},
+    paths::relative_path,
     vault::Entry,
 };
 
 /// Bump to rebuild every index on next open.
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 3;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE notes (
@@ -24,7 +25,12 @@ CREATE TABLE notes (
     title_key TEXT NOT NULL,
     name_key TEXT NOT NULL,
     mtime INTEGER NOT NULL,
-    size INTEGER NOT NULL
+    size INTEGER NOT NULL,
+    -- Front matter `type: task` and its fields.
+    task INTEGER NOT NULL DEFAULT 0,
+    status TEXT,
+    priority TEXT,
+    due TEXT
 );
 CREATE INDEX notes_id_key ON notes(id_key);
 CREATE INDEX notes_title_key ON notes(title_key);
@@ -44,7 +50,23 @@ CREATE TABLE links (
 );
 CREATE INDEX links_src ON links(src);
 CREATE INDEX links_key ON links(key);
-CREATE VIRTUAL TABLE fts USING fts5(title, body, tokenize = 'unicode61 remove_diacritics 2');
+CREATE TABLE tags (
+    src TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    -- Lower-cased, for grouping and lookup.
+    key TEXT NOT NULL
+);
+CREATE INDEX tags_src ON tags(src);
+CREATE INDEX tags_key ON tags(key);
+CREATE TABLE items (
+    src TEXT NOT NULL,
+    marker INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    done INTEGER NOT NULL,
+    due TEXT
+);
+CREATE INDEX items_src ON items(src);
+CREATE VIRTUAL TABLE fts USING fts5(title, headings, tags, body, tokenize = 'unicode61 remove_diacritics 2');
 ";
 
 #[derive(Debug)]
@@ -113,6 +135,92 @@ pub enum Target {
     Invalid,
 }
 
+/// A note offered while typing a wiki link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    pub id: String,
+    pub title: String,
+    /// What to write between `[[` and `]]`: the title when it names this note
+    /// alone, else the id.
+    pub reference: String,
+}
+
+/// A tag and how many notes carry it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagCount {
+    pub tag: String,
+    pub count: usize,
+}
+
+/// A checklist item or a task note.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRow {
+    /// The note holding the item, or the task note.
+    pub src: String,
+    pub title: String,
+    /// A checklist item's marker offset; `None` for a task note.
+    pub marker: Option<usize>,
+    /// The item's text, or the task note's title.
+    pub text: String,
+    /// `open`, `doing` or `done`; an item is `open` or `done`.
+    pub status: String,
+    pub priority: Option<String>,
+    pub due: Option<String>,
+}
+
+impl TaskRow {
+    pub fn is_done(&self) -> bool {
+        self.status == "done"
+    }
+}
+
+/// A note and when its file last changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recent {
+    pub id: String,
+    pub title: String,
+    /// Seconds since the Unix epoch.
+    pub modified: i64,
+}
+
+/// The shape of the vault's links.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub notes: usize,
+    /// Notes no other note links to.
+    pub orphans: Vec<NoteRow>,
+    /// Notes that link to no other note.
+    pub dead_ends: Vec<NoteRow>,
+    /// Notes by how many other notes link to them, most first.
+    pub most_linked: Vec<(NoteRow, usize)>,
+    /// Links that reach nothing or several notes; see [`Index::broken`].
+    pub broken: usize,
+}
+
+/// A link that reaches nothing, or more than one note.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Broken {
+    pub src: String,
+    /// The source note's title.
+    pub title: String,
+    pub link: Link,
+    /// The line holding the link.
+    pub context: String,
+    pub problem: Problem,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Problem {
+    /// No note matches; the id a new note for it would take.
+    Missing(String),
+    /// Several notes match.
+    Ambiguous(Vec<String>),
+    /// A link to a file that does not exist, by vault path.
+    NoFile(String),
+    /// The link climbs out of the vault.
+    Outside,
+}
+
 pub struct Index {
     db: Connection,
 }
@@ -132,7 +240,8 @@ impl Index {
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != SCHEMA {
             db.execute_batch(
-                "DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS fts;",
+                "DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS fts;
+                 DROP TABLE IF EXISTS tags; DROP TABLE IF EXISTS items;",
             )?;
             db.execute_batch(SCHEMA_SQL)?;
             db.execute_batch(&format!("PRAGMA user_version = {SCHEMA}"))?;
@@ -212,10 +321,10 @@ impl Index {
             return Ok(Vec::new());
         };
         let mut stmt = self.db.prepare(
-            "SELECT n.id, n.title, snippet(fts, 1, '', '', '...', 12)
+            "SELECT n.id, n.title, snippet(fts, 3, '', '', '...', 12)
              FROM fts JOIN notes n ON n.rowid = fts.rowid
              WHERE fts MATCH ?1
-             ORDER BY bm25(fts, 10.0, 1.0)
+             ORDER BY bm25(fts, 10.0, 5.0, 5.0, 1.0)
              LIMIT ?2",
         )?;
         let hits = stmt
@@ -254,7 +363,7 @@ impl Index {
     }
 
     /// By path, then title, then file name; case is ignored.
-    fn resolve_wiki(&self, target: &str) -> Result<Target> {
+    pub fn resolve_wiki(&self, target: &str) -> Result<Target> {
         let key = target.trim().to_lowercase();
         for column in ["id_key", "title_key", "name_key"] {
             let mut ids = self.ids_where(column, &key)?;
@@ -276,6 +385,338 @@ impl Index {
             .query_map([key], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(ids)
+    }
+
+    /// Notes whose title or id contains `query`, ignoring case: title prefixes
+    /// first, then by title. Each comes with the reference that names it.
+    pub fn complete(&self, query: &str, limit: usize) -> Result<Vec<Suggestion>> {
+        let key = query.trim().to_lowercase();
+        let escaped = key
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let mut stmt = self.db.prepare_cached(
+            "SELECT id, title FROM notes
+             WHERE title_key LIKE '%' || ?1 || '%' ESCAPE '\\'
+                OR id_key LIKE '%' || ?1 || '%' ESCAPE '\\'
+             ORDER BY title_key LIKE ?1 || '%' ESCAPE '\\' DESC, title_key, id
+             LIMIT ?2",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![escaped, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter()
+            .map(|(id, title)| {
+                let unique = self.resolve_wiki(&title)? == Target::Note(id.clone());
+                let reference = if unique { title.clone() } else { id.clone() };
+                Ok(Suggestion {
+                    id,
+                    title,
+                    reference,
+                })
+            })
+            .collect()
+    }
+
+    /// Notes whose title, file name or id is close to `target`: within a
+    /// third of its length in edits, or containing it. Closest first.
+    pub fn similar(&self, target: &str, limit: usize) -> Result<Vec<NoteRow>> {
+        let key = target.trim().trim_end_matches(".md").to_lowercase();
+        let name = key.rsplit('/').next().unwrap_or(&key).to_owned();
+        if name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .db
+            .prepare("SELECT id, title, id_key, title_key, name_key FROM notes")?;
+        let rows: Vec<(String, String, String, String, String)> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let most = (name.chars().count() / 3).max(1);
+        let mut scored: Vec<(usize, NoteRow)> = rows
+            .into_iter()
+            .filter_map(|(id, title, id_key, title_key, name_key)| {
+                let d = [&id_key, &title_key, &name_key]
+                    .iter()
+                    .map(|k| {
+                        let shorter = k.len().min(name.len());
+                        if shorter >= 3 && (k.contains(&name) || name.contains(k.as_str())) {
+                            1
+                        } else {
+                            edit_distance(k, &name).min(edit_distance(k, &key))
+                        }
+                    })
+                    .min()?;
+                (d <= most).then_some((d, NoteRow { id, title }))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.title.cmp(&b.1.title)));
+        Ok(scored.into_iter().take(limit).map(|(_, n)| n).collect())
+    }
+
+    /// Every wiki and markdown link that reaches no note or file, or several
+    /// notes, by source title. `root` is the vault, to check that files exist.
+    pub fn broken(&self, root: &Path) -> Result<Vec<Broken>> {
+        let mut stmt = self.db.prepare(
+            "SELECT l.src, n.title, l.kind, l.target, l.fragment, l.label, l.start, l.end, l.context
+             FROM links l JOIN notes n ON n.id = l.src
+             WHERE l.kind IN (0, 1)
+             ORDER BY n.title, l.src, l.start",
+        )?;
+        type Row = (
+            String,
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            String,
+        );
+        let rows: Vec<Row> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::new();
+        for (src, title, kind, target, fragment, label, start, end, context) in rows {
+            let link = Link {
+                kind: kind_from(kind),
+                target,
+                fragment,
+                label,
+                range: start as usize..end as usize,
+            };
+            let problem = match self.resolve(&src, &link)? {
+                Target::Missing(id) => Problem::Missing(id),
+                Target::Ambiguous(ids) => Problem::Ambiguous(ids),
+                Target::File(rel) if !root.join(&rel).exists() => Problem::NoFile(rel),
+                Target::Invalid => Problem::Outside,
+                _ => continue,
+            };
+            out.push(Broken {
+                src,
+                title,
+                link,
+                context,
+                problem,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Notes by when their file changed, newest first.
+    pub fn recent(&self, limit: usize) -> Result<Vec<Recent>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT id, title, mtime FROM notes ORDER BY mtime DESC, id LIMIT ?1")?;
+        let rows = stmt
+            .query_map([limit as i64], |r| {
+                Ok(Recent {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    modified: r.get::<_, i64>(2)? / 1_000_000_000,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Orphans, dead ends, the most-linked notes (up to `top`) and the broken
+    /// link count. Every link is resolved, so this reads the whole index.
+    pub fn stats(&self, root: &Path, top: usize) -> Result<Stats> {
+        let notes = self.notes()?;
+        let mut incoming: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        let mut outgoing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stmt = self
+            .db
+            .prepare("SELECT src, kind, target FROM links WHERE kind IN (0, 1)")?;
+        let rows: Vec<(String, i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut broken = 0;
+        for (src, kind, target) in rows {
+            let link = Link {
+                kind: kind_from(kind),
+                target,
+                fragment: None,
+                label: None,
+                range: 0..0,
+            };
+            match self.resolve(&src, &link)? {
+                Target::Note(to) if to != src => {
+                    outgoing.insert(src.clone());
+                    incoming.entry(to).or_default().insert(src);
+                }
+                Target::Note(_) | Target::External(_) => {}
+                Target::File(rel) if root.join(&rel).exists() => {}
+                _ => broken += 1,
+            }
+        }
+        let count = |id: &str| incoming.get(id).map_or(0, |s| s.len());
+        let mut most_linked: Vec<(NoteRow, usize)> = notes
+            .iter()
+            .filter(|n| count(&n.id) > 0)
+            .map(|n| (n.clone(), count(&n.id)))
+            .collect();
+        most_linked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.title.cmp(&b.0.title)));
+        most_linked.truncate(top);
+        let by_title = |mut v: Vec<NoteRow>| {
+            v.sort_by_key(|n| n.title.to_lowercase());
+            v
+        };
+        Ok(Stats {
+            notes: notes.len(),
+            orphans: by_title(
+                notes
+                    .iter()
+                    .filter(|n| count(&n.id) == 0)
+                    .cloned()
+                    .collect(),
+            ),
+            dead_ends: by_title(
+                notes
+                    .iter()
+                    .filter(|n| !outgoing.contains(&n.id))
+                    .cloned()
+                    .collect(),
+            ),
+            most_linked,
+            broken,
+        })
+    }
+
+    /// Every tag, by name ignoring case, with its note count.
+    pub fn tags(&self) -> Result<Vec<TagCount>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT MIN(tag), COUNT(DISTINCT src) FROM tags GROUP BY key ORDER BY key")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(TagCount {
+                    tag: r.get(0)?,
+                    count: r.get::<_, i64>(1)? as usize,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Notes tagged `tag`, ignoring case, by title.
+    pub fn tagged(&self, tag: &str) -> Result<Vec<NoteRow>> {
+        let key = tag.trim().trim_start_matches('#').to_lowercase();
+        let mut stmt = self.db.prepare(
+            "SELECT DISTINCT n.id, n.title FROM tags t JOIN notes n ON n.id = t.src
+             WHERE t.key = ?1 ORDER BY n.title_key, n.id",
+        )?;
+        let rows = stmt
+            .query_map([key], |r| {
+                Ok(NoteRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Note `id`'s tags, as written.
+    pub fn note_tags(&self, id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare_cached("SELECT tag FROM tags WHERE src = ?1 ORDER BY rowid")?;
+        let rows = stmt
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Checklist items and task notes: unfinished first, then by due date
+    /// (none last), then by note and position.
+    pub fn tasks(&self) -> Result<Vec<TaskRow>> {
+        let mut stmt = self.db.prepare(
+            "SELECT i.src, n.title, i.marker, i.text,
+                    CASE WHEN i.done THEN 'done' ELSE 'open' END, NULL, i.due
+             FROM items i JOIN notes n ON n.id = i.src
+             UNION ALL
+             SELECT id, title, NULL, title,
+                    CASE WHEN lower(status) IN ('done', 'doing') THEN lower(status) ELSE 'open' END,
+                    priority, due
+             FROM notes WHERE task",
+        )?;
+        let mut rows: Vec<TaskRow> = stmt
+            .query_map([], |r| {
+                Ok(TaskRow {
+                    src: r.get(0)?,
+                    title: r.get(1)?,
+                    marker: r.get::<_, Option<i64>>(2)?.map(|m| m as usize),
+                    text: r.get(3)?,
+                    status: r.get(4)?,
+                    priority: r.get(5)?,
+                    due: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.sort_by(|a, b| {
+            (a.is_done(), a.due.is_none(), &a.due, &a.title, a.marker).cmp(&(
+                b.is_done(),
+                b.due.is_none(),
+                &b.due,
+                &b.title,
+                b.marker,
+            ))
+        });
+        Ok(rows)
+    }
+
+    /// Every vault file a markdown link or image points at, by vault path.
+    pub fn linked_files(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT src, target FROM links WHERE kind = 1")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            let (src, target) = row?;
+            if let Some(path) = relative_path(&src, &target) {
+                out.insert(path);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Notes with a markdown link or image into folder `dir`, by source id.
+    pub fn sources_linking_under(&self, dir: &str) -> Result<Vec<String>> {
+        let prefix = format!("{dir}/");
+        let mut stmt = self
+            .db
+            .prepare("SELECT DISTINCT src, target FROM links WHERE kind = 1")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (src, target) = row?;
+            if relative_path(&src, &target).is_some_and(|p| p.starts_with(&prefix))
+                && !out.contains(&src)
+            {
+                out.push(src);
+            }
+        }
+        Ok(out)
     }
 
     /// Notes with a link that resolves to `id`, by source id.
@@ -326,6 +767,22 @@ impl Index {
     }
 }
 
+/// Levenshtein distance by characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
 /// The file's modification time (ns) and size, which decide whether to re-read it.
 fn stamp(path: &Path) -> Option<(i64, i64)> {
     let meta = fs::metadata(path).ok()?;
@@ -348,9 +805,11 @@ fn put(
     remove(tx, &entry.id)?;
     let title = entry.title(note);
     let name = entry.id.rsplit('/').next().unwrap_or(&entry.id);
+    let front = &note.front;
+    let task = front.kind.as_deref() == Some("task");
     tx.execute(
-        "INSERT INTO notes (id, title, id_key, title_key, name_key, mtime, size)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO notes (id, title, id_key, title_key, name_key, mtime, size, task, status, priority, due)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             entry.id,
             title,
@@ -358,13 +817,40 @@ fn put(
             title.to_lowercase(),
             name.to_lowercase(),
             mtime,
-            size
+            size,
+            task,
+            front.status,
+            front.priority,
+            front.due,
         ],
     )?;
     tx.execute(
-        "INSERT INTO fts (rowid, title, body) VALUES (last_insert_rowid(), ?1, ?2)",
-        params![title, text],
+        "INSERT INTO fts (rowid, title, headings, tags, body)
+         VALUES (last_insert_rowid(), ?1, ?2, ?3, ?4)",
+        params![
+            title,
+            note.headings.join("\n"),
+            note.front.tags.join("\n"),
+            text
+        ],
     )?;
+    // After the fts row, which takes the notes row's rowid.
+    let mut seen = std::collections::HashSet::new();
+    for tag in &front.tags {
+        let tag = tag.trim().trim_start_matches('#');
+        if !tag.is_empty() && seen.insert(tag.to_lowercase()) {
+            tx.execute(
+                "INSERT INTO tags (src, tag, key) VALUES (?1, ?2, ?3)",
+                params![entry.id, tag, tag.to_lowercase()],
+            )?;
+        }
+    }
+    for item in &note.items {
+        tx.execute(
+            "INSERT INTO items (src, marker, text, done, due) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![entry.id, item.marker as i64, item.text, item.done, item.due],
+        )?;
+    }
     let mut insert = tx.prepare_cached(
         "INSERT INTO links (src, kind, target, fragment, label, start, end, key, context)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -398,6 +884,8 @@ fn remove(tx: &rusqlite::Transaction, id: &str) -> Result<()> {
     )?;
     tx.execute("DELETE FROM notes WHERE id = ?1", [id])?;
     tx.execute("DELETE FROM links WHERE src = ?1", [id])?;
+    tx.execute("DELETE FROM tags WHERE src = ?1", [id])?;
+    tx.execute("DELETE FROM items WHERE src = ?1", [id])?;
     Ok(())
 }
 
@@ -427,51 +915,6 @@ fn line_around(text: &str, at: usize) -> String {
         cut -= 1;
     }
     line[..cut].to_owned()
-}
-
-/// A vault-relative path for a markdown link `target` written in note `from`.
-/// `None` if it climbs above the root. Percent escapes are decoded.
-fn relative_path(from: &str, target: &str) -> Option<String> {
-    let target = percent_decode(target);
-    let mut parts: Vec<&str> = if target.starts_with('/') {
-        Vec::new()
-    } else {
-        let mut dir: Vec<_> = from.split('/').collect();
-        dir.pop();
-        dir
-    };
-    for part in target.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            p => parts.push(p),
-        }
-    }
-    (!parts.is_empty()).then(|| parts.join("/"))
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let hex = |b: u8| (b as char).to_digit(16);
-        if bytes[i] == b'%'
-            && let (Some(h), Some(l)) = (
-                bytes.get(i + 1).copied().and_then(hex),
-                bytes.get(i + 2).copied().and_then(hex),
-            )
-        {
-            out.push((h * 16 + l) as u8);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
 }
 
 /// An FTS5 expression from user input: each word quoted, so FTS syntax
@@ -634,6 +1077,30 @@ mod tests {
     }
 
     #[test]
+    fn headings_and_tags_outrank_body_text() {
+        // One mention in a heading or a tag beats two in the body.
+        let words = "words ".repeat(20);
+        let (_d, _v, index) = vault(
+            "idx-rank",
+            &[
+                ("a.md", &format!("# A\n{words}compost {words}compost\n")),
+                ("b.md", &format!("# B\n## Compost\n{words}{words}\n")),
+                (
+                    "c.md",
+                    &format!("---\ntags: [compost]\n---\n# C\n{words}{words}\n"),
+                ),
+            ],
+        );
+        let ids: Vec<_> = index
+            .search("compost", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(ids.last().map(String::as_str), Some("a"), "{ids:?}");
+    }
+
+    #[test]
     fn sync_picks_up_edits_and_deletions() {
         let (dir, vault, mut index) = vault("idx-sync", &[("a.md", "# One\n"), ("b.md", "")]);
         assert!(!index.sync(&vault).unwrap());
@@ -669,5 +1136,175 @@ mod tests {
         }
         let index = Index::open_at(&path).unwrap();
         assert_eq!(index.notes().unwrap(), []);
+    }
+
+    #[test]
+    fn completion_matches_titles_and_ids() {
+        let (_d, _v, index) = vault(
+            "complete",
+            &[
+                ("projects/katib.md", "# Katib design\n"),
+                ("katib-notes.md", "# Notes on katib\n"),
+                ("a.md", "# Same\n"),
+                ("b.md", "# Same\n"),
+                ("100%.md", "# Percent\n"),
+            ],
+        );
+        let got: Vec<_> = index
+            .complete("kat", 10)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.id, s.reference))
+            .collect();
+        // Title prefixes first; a unique title is the reference.
+        assert_eq!(
+            got,
+            [
+                ("projects/katib".to_owned(), "Katib design".to_owned()),
+                ("katib-notes".to_owned(), "Notes on katib".to_owned()),
+            ]
+        );
+        // A shared title would resolve to neither note, so the id is used.
+        let same: Vec<_> = index.complete("same", 10).unwrap();
+        assert_eq!(
+            same.iter()
+                .map(|s| s.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        // LIKE wildcards in the query are literal.
+        assert_eq!(index.complete("%", 10).unwrap().len(), 1);
+        assert_eq!(index.complete("", 2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn broken_links_and_close_matches() {
+        let (d, _v, index) = vault(
+            "broken",
+            &[
+                (
+                    "a.md",
+                    "# A\n[[Projcts]] [[b]] [[Dup]] [x](gone.png) [y](../../out.md) [z](b.md)\n",
+                ),
+                ("b.md", "# Projects\n"),
+                ("c.md", "# Dup\n"),
+                ("d.md", "# Dup\n"),
+            ],
+        );
+        let broken = index.broken(&d.0).unwrap();
+        let problems: Vec<_> = broken.iter().map(|b| b.problem.clone()).collect();
+        assert_eq!(
+            problems,
+            [
+                Problem::Missing("Projcts".into()),
+                Problem::Ambiguous(vec!["c".into(), "d".into()]),
+                Problem::NoFile("gone.png".into()),
+                Problem::Outside,
+            ]
+        );
+        assert_eq!(broken[0].src, "a");
+        let text = fs::read_to_string(d.0.join("a.md")).unwrap();
+        assert_eq!(&text[broken[0].link.range.clone()], "[[Projcts]]");
+        let near: Vec<_> = index
+            .similar("Projcts", 3)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(near, ["b"]);
+        assert!(index.similar("zzzzzz", 3).unwrap().is_empty());
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn tags_and_tasks() {
+        let (_d, _v, index) = vault(
+            "tasks",
+            &[
+                (
+                    "a.md",
+                    "---\ntags: [Rust, ideas]\n---\n# A\n- [ ] later\n- [ ] soon due:2026-01-02\n- [x] old\n",
+                ),
+                (
+                    "b.md",
+                    "---\ntags:\n  - rust\ntype: task\nstatus: Doing\ndue: 2026-01-01\npriority: high\n---\n# Ship\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            index.tags().unwrap(),
+            [
+                TagCount {
+                    tag: "Rust".into(),
+                    count: 2
+                },
+                TagCount {
+                    tag: "ideas".into(),
+                    count: 1
+                },
+            ]
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+        );
+        let tagged: Vec<_> = index
+            .tagged("#RUST")
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(tagged, ["a", "b"]);
+        assert_eq!(index.note_tags("a").unwrap(), ["Rust", "ideas"]);
+        let tasks: Vec<_> = index
+            .tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.text, t.status, t.due))
+            .collect();
+        assert_eq!(
+            tasks,
+            [
+                (
+                    "Ship".to_owned(),
+                    "doing".to_owned(),
+                    Some("2026-01-01".to_owned())
+                ),
+                (
+                    "soon due:2026-01-02".to_owned(),
+                    "open".to_owned(),
+                    Some("2026-01-02".to_owned())
+                ),
+                ("later".to_owned(), "open".to_owned(), None),
+                ("old".to_owned(), "done".to_owned(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn stats_count_links_between_notes() {
+        let (d, _v, index) = vault(
+            "stats",
+            &[
+                ("hub.md", "# Hub\n[[a]] [[b]] [[hub]]\n"),
+                ("a.md", "# A\n[[b]] [[gone]] [x](pic.png)\n"),
+                ("b.md", "# B\n"),
+                ("lone.md", "# Lone\n"),
+            ],
+        );
+        let s = index.stats(&d.0, 10).unwrap();
+        let ids = |v: &[NoteRow]| v.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+        assert_eq!(s.notes, 4);
+        // A link to itself does not count.
+        assert_eq!(ids(&s.orphans), ["hub", "lone"]);
+        assert_eq!(ids(&s.dead_ends), ["b", "lone"]);
+        assert_eq!(
+            s.most_linked
+                .iter()
+                .map(|(n, c)| (n.id.as_str(), *c))
+                .collect::<Vec<_>>(),
+            [("b", 2), ("a", 1)]
+        );
+        assert_eq!(s.broken, 2);
+        assert_eq!(index.recent(2).unwrap().len(), 2);
     }
 }

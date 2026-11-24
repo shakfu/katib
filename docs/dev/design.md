@@ -210,7 +210,11 @@ Content addressing makes sync safe for every backend: two machines adding the sa
 
 ### 6.3 What ships first
 
-Only the `git` backend and the content-addressed naming. The naming is the part that is costly to change later, since it appears in every note's links. `lfs` and `store` are added when a vault needs them; neither changes a note.
+The `git` and `lfs` backends and the content-addressed naming. As built (`katib_core::attach`): pasting an image or files, dropping files, or "Attach file..." stores each file and links it at the caret; files over 50 MB are refused. Reading and hashing run off the main thread. With `backend = "lfs"`, storing an attachment adds `attachments/** filter=lfs ...` to `.gitattributes`, and sync runs `git lfs install --local`; sync stays off if git-lfs is missing, so attachments are never committed as plain files by mistake. `backend = "store"` is refused until it is built.
+
+With LFS, a fast-forward checks attachments out as pointers (`GIT_LFS_SKIP_SMUDGE=1`), then `git lfs pull` downloads them. An unreachable LFS server therefore delays attachments but not notes; the status bar says so and the next cycle retries. Turning on `lfs` stages already-committed attachments again (`git add --renormalize`), so the next commit stores them as pointers; history is not rewritten. Storing a file whose copy on disk is still a pointer writes the real bytes. Pushing uploads objects through git-lfs's pre-push hook. Tests cover two clones of a local remote, including a lost object that downloads once restored.
+
+Live mode draws local images; remote images stay alt text, since fetching them would tell their server each time a note is read. "Remove unused attachments..." moves unlinked files to `.katib/trash/`. The naming is the part that is costly to change later, since it appears in every note's links. `store` is added when a vault needs it; it changes no note.
 
 ## 7. Links and the index
 
@@ -218,17 +222,33 @@ As in gwiki, by reference to `~/projects/personal/gwiki/docs/dev/wiki-design.md`
 
 - `[[Title]]`, `[[path#Heading|label]]`, and relative markdown links. Resolution order: path, then title, then file name; an ambiguous link lists its candidates.
 - The index holds notes, headings, links, tags and the FTS5 text. It re-reads a file whose size or modification time differs, and rebuilds when its schema version differs, so it is never synced. The window reads it while a background thread syncs it (SQLite WAL).
-- Moving a note rewrites every link to it, in one commit.
+- Moving a note rewrites every link to it, in one commit. Wiki links take the new file name when it is unambiguous, else the full path; a link by an explicit title still resolves and is left alone. The moved note's own relative links, images included, are rebased onto its new folder. Reference-style links are rewritten in their definition line. Moving a folder moves every file in it, and rewrites links into it from outside, including images. Each rewritten file is written with the same guard as a save. A move waits while a sync runs, so its writes land in one cycle.
+- Deleting a note moves it to `.katib/trash/` (gitignored), keeping its folder; sync then commits the deletion. Folders emptied by a move or delete are removed.
 
 ## 8. The window
 
 Built from gpui-kit 0.11.0 components:
 
-- `Sidebar` with a `Tree` of the vault.
+- `TitleBar` on every platform, drawn by the window, holding the `Toolbar` and the note's title. On Linux this uses client-side decorations.
+- `Toolbar`: sidebar, palette, new note, the daily-note `Calendar` in a `Popover`, mode, settings, and a `DropdownMenu` of note commands.
+- A `Tree` of the vault, with a context menu per note and folder.
+- `TabBar`: one tab per open note. Opening a note shows its tab if it has one, else replaces the active tab's note; "new tab" (cmd-t, or the tree menu) opens beside it. Each tab autosaves on its own; sync waits until every tab is saved.
 - The editor (section 4), with a backlinks panel under it.
-- `Command` as the palette: open a note, run a command, search.
-- `StatusBar`: sync state, unpushed commits, conflicts.
-- `Dialog` for conflict resolution and vault setup.
+- Link completion: typing after `[[` offers notes by title or path, title prefixes first; tab or enter writes the reference (the title when it names one note, else the path) and closes the link. Live mode draws its own menu; raw mode uses the editor's `CompletionProvider`.
+- Back and forward per tab (ctrl-- and ctrl-shift-- on macOS, alt-left and alt-right elsewhere): each tab remembers up to 100 (note, caret) places. A move renames the notes in the history; a deleted note is dropped when reached.
+- "Broken links...": every wiki or markdown link that reaches no note or file, several notes, or outside the vault. A missing note offers up to three close matches (edit distance within a third of the name, or containing it) and "Create"; an ambiguous one offers each match. A repair rewrites that one link, keeping its heading and label, and is refused if the note changed since the list was made.
+- Tasks: checklist items (`- [ ] text`, with an optional `due:YYYY-MM-DD`) in any note, and task notes (front matter `type: task` with `status` open, doing or done, `priority`, `due`). "Tasks..." lists both, open first, then by due date; overdue dates show in red, those within 7 days in amber. A row ticks an item or sets a task note's status, and "Promote" turns an item into a task note beside its note, replacing the item with a link. In live mode, clicking a checkbox ticks it as one undo step.
+- Tags: front matter `tags`, as `[a, b]`, `a, b` or a `- a` list; inline `#tag` is not read, as in gwiki, since it collides with headings and issue numbers. Tags match ignoring case. The palette lists tags for `#` and the notes tagged for `#name`; "Edit tags..." rewrites the field as a flow list; the status bar shows the note's tags.
+- Front matter is read and written by `katib_core::front`, which handles top-level `key: value` lines only and leaves other lines as they are. The index schema is version 2: `tags` and `items` tables, and task fields on `notes`.
+- Overview: the first tab, fixed, shown when no note tab is selected. Its sections: Latest (notes by file time, with the last commit's author from one `git log -n500` over the vault, or "not committed"), Tasks, and Stats (note count, broken links, most-linked notes, orphans, dead ends, tags). A link to itself does not count. Stats resolve every link, so they are computed when the overview opens, on Refresh, and after an index sync while it shows. A note opened from the overview gets a new tab.
+- Search ranks a match in the title (weight 10) above one in a heading or tag (5) above body text (1), as separate FTS5 columns (index schema 3).
+- `Command` as the palette: open a note, search, create, or run a command. A command row shows its key binding.
+- `StatusBar`: the note, its save state, words, indexing, and the sync state, which runs a cycle when clicked.
+- `Settings` in a `Dialog`: sync on or off, the attachment backend, the journal folder. They are written to `.katib/config.toml`, so they are committed with the vault; changing sync or the backend restarts sync.
+- `AlertDialog` to confirm deletes; `Dialog` for names and conflicts.
+- A menu bar whose items dispatch the same actions as the keys: native on macOS, which keeps the system's menu search, shortcut rebinding and accessibility; on Windows and Linux an `AppMenuBar` at the start of the title bar. The title bar's close button saves first, as the OS close does.
+
+Daily notes are `<journal folder>/<YYYY-MM-DD>.md`, `journal/` by default; cmd-shift-d opens today's.
 
 ## 9. Testing
 

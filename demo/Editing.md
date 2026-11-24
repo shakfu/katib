@@ -17,6 +17,13 @@ fn main() {
 }
 ```
 
+## Attachments
+
+Paste an image, drop a file on the note, or use "Attach file..." in the palette (cmd-p).
+The file is stored under `attachments/`, named by the SHA-256 of its bytes:
+
+![blocks](attachments/03/03811276fde1385123df9895bf943343db3127858008581fe909f5bb8e6da7e9-blocks.svg)
+
 ## Undo
 
 Cmd-z undoes a word at a time; cmd-shift-z redoes.

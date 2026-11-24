@@ -4,6 +4,7 @@
 use std::{
     cell::RefCell,
     fs, io,
+    path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -16,7 +17,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
-use katib_core::{Entry, Index, Link, SaveError, Vault, save_guarded};
+use katib_core::{Entry, Index, Link, SaveError, Vault, attach, save_guarded};
 use katib_editor::{EditorEvent, LiveEditor};
 
 /// Save after this long without typing.
@@ -47,6 +48,8 @@ pub enum PaneEvent {
     Saved,
     OpenLink(Link),
     Close,
+    /// Something failed that the user should hear about.
+    Error(String),
 }
 
 pub struct NotePane {
@@ -81,25 +84,40 @@ impl NotePane {
         cx: &mut Context<Self>,
     ) -> Self {
         let draft = vault.read_draft(&entry).filter(|d| *d != text);
-        let live = cx.new(|cx| LiveEditor::new(text.clone(), window, cx));
+        let live = cx.new(|cx| {
+            let mut editor = LiveEditor::new(text.clone(), window, cx);
+            editor.set_note(vault.root().to_owned(), entry.id.clone(), cx);
+            editor.set_completer(crate::complete::completer(index.clone()));
+            editor
+        });
         let raw = cx.new(|cx| {
-            EditorState::new(window, cx)
+            let mut state = EditorState::new(window, cx)
                 .language("markdown")
                 .line_number(false)
                 .soft_wrap(true)
-                .default_value(text.clone())
+                .default_value(text.clone());
+            state.lsp_mut().completion_provider =
+                Some(Rc::new(crate::complete::WikiCompletions(index.clone())));
+            state
         });
-        let subscriptions = vec![
-            cx.subscribe(&live, |this, _, event: &EditorEvent, cx| match event {
-                EditorEvent::Changed => this.changed(cx),
-                EditorEvent::OpenLink(link) => cx.emit(PaneEvent::OpenLink(link.clone())),
-            }),
-            cx.subscribe(&raw, |this, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.changed(cx);
-                }
-            }),
-        ];
+        let subscriptions =
+            vec![
+                cx.subscribe_in(&live, window, |this, _, event: &EditorEvent, window, cx| {
+                    match event {
+                        EditorEvent::Changed => this.changed(cx),
+                        EditorEvent::OpenLink(link) => cx.emit(PaneEvent::OpenLink(link.clone())),
+                        EditorEvent::PasteImage(bytes, ext) => {
+                            this.attach_bytes(bytes.clone(), format!("pasted.{ext}"), window, cx)
+                        }
+                        EditorEvent::PasteFiles(paths) => this.attach_files(paths, window, cx),
+                    }
+                }),
+                cx.subscribe(&raw, |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.changed(cx);
+                    }
+                }),
+            ];
         Self {
             vault,
             index,
@@ -140,7 +158,16 @@ impl NotePane {
         }
     }
 
-    fn head(&self, cx: &App) -> usize {
+    /// Words in the buffer, for the status bar.
+    pub fn words(&self, cx: &App) -> usize {
+        match self.mode {
+            Mode::Live => self.live.read(cx).text().split_whitespace().count(),
+            Mode::Raw => self.raw.read(cx).value().split_whitespace().count(),
+        }
+    }
+
+    /// The caret's byte offset.
+    pub fn head(&self, cx: &App) -> usize {
         match self.mode {
             Mode::Live => self.live.read(cx).head(),
             Mode::Raw => self.raw.read(cx).cursor(),
@@ -194,19 +221,103 @@ impl NotePane {
         cx.notify();
     }
 
-    /// Move the caret to byte `offset` and scroll to it.
+    /// Insert `text` at the caret as one undo step.
+    fn insert(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.mode {
+            Mode::Live => self.live.update(cx, |e, cx| e.insert(text, window, cx)),
+            Mode::Raw => self
+                .raw
+                .update(cx, |s, cx| s.insert(text.to_owned(), window, cx)),
+        }
+    }
+
+    /// Store files as attachments and link them at the caret, one per line.
+    /// Reading and hashing run in the background; a file can be 50 MB.
+    pub fn attach_files(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let (vault, id) = (self.vault.clone(), self.entry.id.clone());
+        let paths: Vec<_> = paths.iter().filter(|p| p.is_file()).cloned().collect();
+        self.attach_in_background(window, cx, move || {
+            paths
+                .iter()
+                .map(|path| {
+                    let name = path
+                        .file_name()
+                        .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+                    attach::store_file(&vault, path)
+                        .map(|rel| attach::link_markdown(&id, &rel, &name))
+                        .map_err(|e| format!("{name}: {e}"))
+                })
+                .collect()
+        });
+    }
+
+    fn attach_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (vault, id) = (self.vault.clone(), self.entry.id.clone());
+        self.attach_in_background(window, cx, move || {
+            vec![
+                attach::store(&vault, &bytes, &name)
+                    .map(|rel| attach::link_markdown(&id, &rel, &name))
+                    .map_err(|e| e.to_string()),
+            ]
+        });
+    }
+
+    /// Run `store` off the main thread, then insert the links it made at the caret.
+    fn attach_in_background(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        store: impl FnOnce() -> Vec<Result<String, String>> + Send + 'static,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let results = cx.background_spawn(async move { store() }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let mut links = Vec::new();
+                for result in results {
+                    match result {
+                        Ok(link) => links.push(link),
+                        Err(e) => cx.emit(PaneEvent::Error(e)),
+                    }
+                }
+                if !links.is_empty() {
+                    this.insert(&links.join("\n"), window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Move the caret to byte `offset`, scroll to it, and focus the editor.
     pub fn go_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.place_caret(offset, window, cx);
+        self.focus(window, cx);
+    }
+
+    /// Move the caret to byte `offset` and scroll to it, without focusing.
+    pub fn place_caret(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text(cx);
+        let mut offset = offset.min(text.len());
+        while !text.is_char_boundary(offset) {
+            offset -= 1;
+        }
         match self.mode {
             Mode::Live => self.live.update(cx, |e, cx| e.move_caret(offset, cx)),
             Mode::Raw => {
-                // `set_cursor_position` scrolls; a heading starts its line, so column 0.
-                let line = self.text(cx)[..offset].matches('\n').count() as u32;
+                // `set_cursor_position` scrolls. Its column counts characters.
+                let line_start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+                let line = text[..offset].matches('\n').count() as u32;
+                let column = text[line_start..offset].chars().count() as u32;
                 self.raw.update(cx, |s, cx| {
-                    s.set_cursor_position(Position::new(line, 0), window, cx)
+                    s.set_cursor_position(Position::new(line, column), window, cx)
                 });
             }
         }
-        self.focus(window, cx);
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
@@ -416,6 +527,10 @@ impl Render for NotePane {
                 div()
                     .flex_1()
                     .min_h_0()
+                    // Files dropped on the note become attachments.
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        this.attach_files(paths.paths(), window, cx);
+                    }))
                     .when(self.mode == Mode::Live, |d| d.child(self.live.clone()))
                     .when(self.mode == Mode::Raw, |d| {
                         d.p_4().child(Editor::new(&self.raw).h_full())

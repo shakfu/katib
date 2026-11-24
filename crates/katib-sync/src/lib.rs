@@ -11,6 +11,7 @@ use std::{
     fmt, io,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -59,6 +60,8 @@ pub struct Report {
     pub outcome: Outcome,
     /// Local commits the remote does not have.
     pub ahead: usize,
+    /// Why some LFS attachments are not downloaded yet; retried next cycle.
+    pub lfs_error: Option<String>,
 }
 
 /// A merge that stopped on conflicts.
@@ -89,6 +92,10 @@ pub struct Repo {
     root: PathBuf,
     /// Extra environment for every git command (tests isolate the config).
     env: Vec<(String, String)>,
+    /// Attachments go through git-lfs; set by [`Repo::enable_lfs`].
+    lfs: bool,
+    /// The work tree may hold LFS pointers whose objects are not downloaded.
+    lfs_pending: AtomicBool,
 }
 
 impl Repo {
@@ -102,6 +109,8 @@ impl Repo {
         let repo = Self {
             root: root.to_owned(),
             env,
+            lfs: false,
+            lfs_pending: AtomicBool::new(false),
         };
         let top = match repo.git(["rev-parse", "--show-toplevel"]) {
             Ok(top) => PathBuf::from(top.trim()),
@@ -222,6 +231,72 @@ impl Repo {
             .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()))
     }
 
+    /// Set the repository up for git-lfs: its filters in `.git/config` and its
+    /// hooks, which push LFS objects. Fails if git-lfs is not installed, so an
+    /// LFS vault never commits attachments as plain files by accident.
+    ///
+    /// Attachments committed before the switch are staged again as pointers,
+    /// so the next commit moves them to LFS. History is not rewritten.
+    /// Call after `.gitattributes` routes `attachments/**` through LFS.
+    pub fn enable_lfs(&mut self) -> Result<()> {
+        self.git(["lfs", "version"])?;
+        self.git(["lfs", "install", "--local"])?;
+        self.lfs = true;
+        // A clone made without git-lfs, or an interrupted pull, leaves pointers.
+        self.lfs_pending.store(true, Ordering::Relaxed);
+        let pointers: std::collections::HashSet<String> = self
+            .git(["lfs", "ls-files", "--name-only"])?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let plain: Vec<String> = self
+            .git(["ls-files", "-z", "--", "attachments"])?
+            .split('\0')
+            .filter(|p| !p.is_empty() && !pointers.contains(*p))
+            .map(str::to_owned)
+            .collect();
+        for chunk in plain.chunks(100) {
+            let mut args = vec!["add", "--renormalize", "--"];
+            args.extend(chunk.iter().map(String::as_str));
+            self.git(args)?;
+        }
+        Ok(())
+    }
+
+    /// Move the work tree to `rev` by fast-forward. With LFS, attachments are
+    /// written as pointers and downloaded afterwards by [`Repo::lfs_pull`], so
+    /// an unreachable LFS server cannot stop notes from syncing.
+    fn fast_forward(&self, rev: &str) -> Result<()> {
+        let mut cmd = self.command(["merge", "--ff-only", "--quiet", rev]);
+        if self.lfs {
+            cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
+            self.lfs_pending.store(true, Ordering::Relaxed);
+        }
+        let out = cmd.output().map_err(SyncError::Spawn)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(failed(
+                &["merge".into(), "--ff-only".into(), rev.into()],
+                &out,
+            ))
+        }
+    }
+
+    /// Download LFS objects the work tree lacks; the error if that failed.
+    fn lfs_pull(&self, remote: &str) -> Option<String> {
+        if !self.lfs || !self.lfs_pending.load(Ordering::Relaxed) {
+            return None;
+        }
+        match self.git(["lfs", "pull", remote]) {
+            Ok(_) => {
+                self.lfs_pending.store(false, Ordering::Relaxed);
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        }
+    }
+
     /// Whether the work tree differs from HEAD, untracked files included.
     pub fn has_changes(&self) -> Result<bool> {
         Ok(!self
@@ -269,6 +344,7 @@ impl Repo {
             committed,
             outcome,
             ahead,
+            lfs_error: None,
         };
         let Some((remote, merge)) = self.upstream()? else {
             return Ok(report(Outcome::NoRemote, 0));
@@ -281,6 +357,10 @@ impl Repo {
             let ahead = self.ahead_behind().map_or(0, |(a, _)| a);
             return Ok(report(Outcome::Offline(e.to_string()), ahead));
         }
+        let report = |outcome, ahead| Report {
+            lfs_error: self.lfs_pull(&remote),
+            ..report(outcome, ahead)
+        };
         let (ahead, behind) = self.ahead_behind()?;
         if behind > 0 {
             if ahead > 0 {
@@ -295,7 +375,7 @@ impl Repo {
                     }
                 }
             } else {
-                self.git(["merge", "--ff-only", "--quiet", "@{u}"])?;
+                self.fast_forward("@{u}")?;
             }
         }
         let (ahead, _) = self.ahead_behind()?;
@@ -362,8 +442,7 @@ impl Repo {
             ])?
             .trim()
             .to_owned();
-        self.git(["merge", "--ff-only", "--quiet", &commit])?;
-        Ok(())
+        self.fast_forward(&commit)
     }
 
     /// The three versions of a conflicted `path`.
@@ -409,6 +488,8 @@ impl Repo {
         };
         let scratch = Repo {
             root: self.root.clone(),
+            lfs: false,
+            lfs_pending: AtomicBool::new(false),
             env: self
                 .env
                 .iter()
@@ -463,6 +544,76 @@ fn failed(args: &[std::ffi::OsString], out: &Output) -> SyncError {
         .collect::<Vec<_>>()
         .join(" ");
     SyncError::Git(args, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The newest commit to touch a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastCommit {
+    pub author: String,
+    /// Seconds since the Unix epoch.
+    pub time: i64,
+}
+
+/// The newest commit to each file in the last `limit` commits, by path from
+/// the root. Empty when `root` is not the top of a repository or has no
+/// commits. Reads only; unlike [`Repo::open`], it writes nothing.
+pub fn last_commits(root: &Path, limit: usize) -> std::collections::HashMap<String, LastCommit> {
+    last_commits_with_env(root, limit, &[])
+}
+
+fn last_commits_with_env(
+    root: &Path,
+    limit: usize,
+    env: &[(String, String)],
+) -> std::collections::HashMap<String, LastCommit> {
+    let mut out = std::collections::HashMap::new();
+    let git = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(root)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        return out;
+    };
+    if Path::new(top.trim()).canonicalize().ok() != root.canonicalize().ok() {
+        return out;
+    }
+    let limit = format!("-n{limit}");
+    let Some(log) = git(&[
+        "-c",
+        "core.quotePath=false",
+        "log",
+        &limit,
+        "--format=%x01%an%x00%at",
+        "--name-only",
+    ]) else {
+        return out;
+    };
+    let mut current: Option<LastCommit> = None;
+    for line in log.lines() {
+        if let Some(header) = line.strip_prefix('\u{1}') {
+            let (author, time) = header.split_once('\0').unwrap_or((header, "0"));
+            current = Some(LastCommit {
+                author: author.to_owned(),
+                time: time.trim().parse().unwrap_or(0),
+            });
+        } else if !line.is_empty()
+            && let Some(c) = &current
+        {
+            out.entry(line.to_owned()).or_insert_with(|| c.clone());
+        }
+    }
+    out
 }
 
 /// `dir/name (conflict host).md` for `dir/name.md`.

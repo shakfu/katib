@@ -11,3 +11,8 @@ katib-sync.workspace = true
 # syntect: markdown highlighting in raw mode.
 gpui-kit = { workspace = true, features = ["syntect"] }
 notify = "8"
+# The local date, for daily notes; gpui-kit already depends on it.
+jiff = "1"
+# The types of the raw editor's completion api; the versions gpui-kit uses.
+lsp-types = "=0.97.0"
+anyhow = "1"

@@ -134,12 +134,23 @@ impl Vault {
         Ok(entry)
     }
 
-    /// `.katib/`, created with a `.gitignore` for its machine-local parts.
+    /// `.katib/`, with a `.gitignore` listing its machine-local parts.
     pub fn katib_dir(&self) -> Result<PathBuf, VaultError> {
         let dir = self.root.join(".katib");
         let ignore = dir.join(".gitignore");
-        if !ignore.exists() {
-            write_atomic(&ignore, "cache/\ndrafts/\n")
+        let current = fs::read_to_string(&ignore).unwrap_or_default();
+        let missing: String = ["cache/", "drafts/", "trash/"]
+            .iter()
+            .filter(|line| !current.lines().any(|l| l.trim() == **line))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        if !missing.is_empty() {
+            let sep = if current.is_empty() || current.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            write_atomic(&ignore, &format!("{current}{sep}{missing}"))
                 .map_err(|e| VaultError::Io(ignore.clone(), e))?;
         }
         Ok(dir)

@@ -1,6 +1,9 @@
 use std::ops::Range;
 
-use crate::md::{self, Kind, Node};
+use crate::{
+    front::{self, Front},
+    md::{self, Kind, Node},
+};
 
 /// A parsed note. Byte ranges index into the source it was parsed from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8,6 +11,38 @@ pub struct Note {
     /// The front matter's `title`, else the first level-one heading.
     pub heading_title: Option<String>,
     pub links: Vec<Link>,
+    pub front: Front,
+    /// Checklist items, `- [ ] text`, in source order.
+    pub items: Vec<Item>,
+    /// Every heading's text, in source order.
+    pub headings: Vec<String>,
+}
+
+/// A checklist item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Item {
+    /// The byte offset of its `[ ]` or `[x]`.
+    pub marker: usize,
+    /// The item's line after the marker, trimmed.
+    pub text: String,
+    pub done: bool,
+    /// An inline `due:YYYY-MM-DD`.
+    pub due: Option<String>,
+}
+
+/// The date of a `due:YYYY-MM-DD` word in `text`.
+pub fn due_word(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|w| {
+        let d = w.strip_prefix("due:")?;
+        let b = d.as_bytes();
+        let ok = b.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+        ok.then(|| d.to_owned())
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +69,9 @@ pub fn parse(source: &str) -> Note {
     let mut note = Note {
         heading_title: None,
         links: Vec::new(),
+        front: Front::default(),
+        items: Vec::new(),
+        headings: Vec::new(),
     };
     let nodes = md::parse(source);
     if let Some(Node {
@@ -42,7 +80,8 @@ pub fn parse(source: &str) -> Note {
         ..
     }) = nodes.first()
     {
-        note.heading_title = front_matter_title(&source[range.clone()]);
+        note.front = front::read(&source[range.clone()]);
+        note.heading_title = note.front.title.clone();
     }
     walk(&nodes, source, false, &mut note);
     note.links.sort_by_key(|l| l.range.start);
@@ -78,29 +117,28 @@ fn slug(text: &str) -> String {
         .collect()
 }
 
-/// The top-level `title:` of YAML front matter, unquoted. Not a YAML parser:
-/// block scalars and escapes inside quotes are not read.
-fn front_matter_title(block: &str) -> Option<String> {
-    block.lines().find_map(|line| {
-        let value = line.strip_prefix("title:")?.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            .unwrap_or(value);
-        (!value.is_empty()).then(|| value.to_owned())
-    })
-}
-
 fn walk(nodes: &[Node], source: &str, in_link: bool, note: &mut Note) {
     for node in nodes {
         match &node.kind {
-            Kind::Heading(1) if note.heading_title.is_none() => {
-                note.heading_title = Some(node.plain_text().trim().to_owned());
+            Kind::Heading(level) => {
+                let text = node.plain_text().trim().to_owned();
+                if *level == 1 && note.heading_title.is_none() {
+                    note.heading_title = Some(text.clone());
+                }
+                note.headings.push(text);
             }
+            Kind::Item {
+                checked: Some(done),
+                ..
+            } => note.items.extend(item(source, node.range.clone(), *done)),
             Kind::Link { url } => {
                 note.links
                     .push(markdown_link(url, node.plain_text(), node.range.clone()));
+            }
+            // An image is a link to a file: moves rewrite it, attachments count it.
+            Kind::Image { url, alt } => {
+                note.links
+                    .push(markdown_link(url, alt.clone(), node.range.clone()));
             }
             // The value has escapes resolved; scan the source so ranges stay exact.
             Kind::Text(_) => text_links(
@@ -114,6 +152,24 @@ fn walk(nodes: &[Node], source: &str, in_link: bool, note: &mut Note) {
         let in_link = in_link || matches!(node.kind, Kind::Link { .. });
         walk(&node.children, source, in_link, note);
     }
+}
+
+/// The checklist item whose list item spans `range`: its marker is the first
+/// `[ ]`, `[x]` or `[X]` on its first line.
+fn item(source: &str, range: Range<usize>, done: bool) -> Option<Item> {
+    let s = &source[range.clone()];
+    let line = &s[..s.find('\n').unwrap_or(s.len())];
+    let at = ["[ ]", "[x]", "[X]"]
+        .iter()
+        .filter_map(|m| line.find(m))
+        .min()?;
+    let text = line[at + 3..].trim().to_owned();
+    Some(Item {
+        marker: range.start + at,
+        due: due_word(&text),
+        text,
+        done,
+    })
 }
 
 fn markdown_link(url: &str, label: String, range: Range<usize>) -> Link {
@@ -522,5 +578,31 @@ mod tests {
             Some(s.find("# Quoted").unwrap())
         );
         assert_eq!(heading_offset(s, "intro"), None);
+    }
+
+    #[test]
+    fn checklist_items_and_due_dates() {
+        let src = "# T\n\n- [ ] write due:2026-12-01\n- [x] done item\n- plain\n  - [X] nested\n";
+        let items = parse(src).items;
+        let got: Vec<_> = items
+            .iter()
+            .map(|i| {
+                (
+                    &src[i.marker..i.marker + 3],
+                    i.text.as_str(),
+                    i.done,
+                    i.due.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("[ ]", "write due:2026-12-01", false, Some("2026-12-01")),
+                ("[x]", "done item", true, None),
+                ("[X]", "nested", true, None),
+            ]
+        );
+        assert_eq!(due_word("due:2026-1-01"), None);
     }
 }

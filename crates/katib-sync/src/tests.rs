@@ -208,3 +208,121 @@ fn names_and_times() {
     assert_eq!(iso8601(t), "2026-11-18T11:06:40Z");
     assert_eq!(iso8601(UNIX_EPOCH), "1970-01-01T00:00:00Z");
 }
+
+fn lfs_installed() -> bool {
+    let ok = Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("skipped: git-lfs is not installed");
+    }
+    ok
+}
+
+const ATTRIBUTES: &str = "attachments/** filter=lfs diff=lfs merge=lfs -text\n";
+
+fn is_pointer(text: &str) -> bool {
+    text.starts_with("version https://git-lfs.github.com/spec/v1")
+}
+
+#[test]
+fn lfs_commits_attachments_as_pointers() {
+    if !lfs_installed() {
+        return;
+    }
+    let (_f, mut a, _b) = Fixture::new("lfs", &[("a.md", "a\n")]);
+    a.enable_lfs().unwrap();
+    write(&a, ".gitattributes", ATTRIBUTES);
+    write(&a, "attachments/ab/abc-x.png", "binary bytes");
+    assert!(a.commit_all("A").unwrap());
+    let blob = git(&a.root, &["show", "HEAD:attachments/ab/abc-x.png"]);
+    assert!(is_pointer(&blob), "{blob}");
+    // The work tree keeps the real bytes.
+    assert_eq!(
+        read(&a, "attachments/ab/abc-x.png").as_deref(),
+        Some("binary bytes")
+    );
+}
+
+#[test]
+fn lfs_objects_reach_the_other_clone() {
+    if !lfs_installed() {
+        return;
+    }
+    let (f, mut a, mut b) = Fixture::new("lfs-sync", &[("a.md", "a\n")]);
+    a.enable_lfs().unwrap();
+    b.enable_lfs().unwrap();
+    write(&a, ".gitattributes", ATTRIBUTES);
+    write(&a, "attachments/ab/abc-x.png", "binary bytes");
+    let report = a.sync(true, "A").unwrap();
+    assert_eq!((report.outcome, report.lfs_error), (Outcome::Synced, None));
+    let report = b.sync(true, "B").unwrap();
+    assert_eq!((report.outcome, report.lfs_error), (Outcome::Synced, None));
+    assert_eq!(
+        read(&b, "attachments/ab/abc-x.png").as_deref(),
+        Some("binary bytes")
+    );
+    assert!(!b.has_changes().unwrap());
+
+    // The LFS server loses the next object: the note still syncs, the
+    // attachment stays a pointer, and the next cycle downloads it.
+    write(&a, "attachments/cd/cde-y.png", "more bytes");
+    write(&a, "a.md", "a, edited\n");
+    a.sync(true, "A").unwrap();
+    let objects = f.dir.join("remote.git/lfs");
+    let hidden = f.dir.join("lfs-hidden");
+    fs::rename(&objects, &hidden).unwrap();
+    let report = b.sync(true, "B").unwrap();
+    assert_eq!(report.outcome, Outcome::Synced);
+    assert!(report.lfs_error.is_some(), "{report:?}");
+    assert_eq!(read(&b, "a.md").as_deref(), Some("a, edited\n"));
+    assert!(is_pointer(&read(&b, "attachments/cd/cde-y.png").unwrap()));
+    assert!(!b.has_changes().unwrap());
+    // The failed download may have recreated the directory.
+    let _ = fs::remove_dir_all(&objects);
+    fs::rename(&hidden, &objects).unwrap();
+    let report = b.sync(true, "B").unwrap();
+    assert_eq!(report.lfs_error, None);
+    assert_eq!(
+        read(&b, "attachments/cd/cde-y.png").as_deref(),
+        Some("more bytes")
+    );
+    assert!(!b.has_changes().unwrap());
+}
+
+#[test]
+fn enabling_lfs_moves_plain_attachments_to_lfs() {
+    if !lfs_installed() {
+        return;
+    }
+    let (_f, mut a, _b) = Fixture::new(
+        "lfs-switch",
+        &[("a.md", "a\n"), ("attachments/ab/abc-x.png", "old bytes")],
+    );
+    let blob = git(&a.root, &["show", "HEAD:attachments/ab/abc-x.png"]);
+    assert_eq!(blob, "old bytes");
+    write(&a, ".gitattributes", ATTRIBUTES);
+    a.enable_lfs().unwrap();
+    assert!(a.commit_all("A").unwrap());
+    let blob = git(&a.root, &["show", "HEAD:attachments/ab/abc-x.png"]);
+    assert!(is_pointer(&blob), "{blob}");
+    assert!(!a.has_changes().unwrap());
+}
+
+#[test]
+fn last_commits_name_the_newest_author_per_file() {
+    let (_f, a, _b) = Fixture::new("authors", &[("a.md", "a\n"), ("dir/b c.md", "b\n")]);
+    write(&a, "a.md", "edited\n");
+    let mut env = env();
+    env.retain(|(k, _)| !k.starts_with("GIT_AUTHOR_NAME"));
+    env.push(("GIT_AUTHOR_NAME".into(), "second".into()));
+    let second = Repo::open_with_env(&a.root, env.clone()).unwrap().unwrap();
+    second.commit_all("A").unwrap();
+    let got = last_commits_with_env(&a.root, 50, &env);
+    assert_eq!(got["a.md"].author, "second");
+    assert_eq!(got["dir/b c.md"].author, "test");
+    assert!(got["a.md"].time > 0);
+    let sub = a.root.join("dir");
+    assert!(last_commits_with_env(&sub, 50, &env).is_empty());
+}
