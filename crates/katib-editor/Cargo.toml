@@ -1,0 +1,11 @@
+[package]
+name = "katib-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+katib-core.workspace = true
+unicode-segmentation = "1.12"
+

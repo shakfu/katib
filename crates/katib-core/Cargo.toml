@@ -1,0 +1,9 @@
+[package]
+name = "katib-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pulldown-cmark.workspace = true
+rusqlite.workspace = true

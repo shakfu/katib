@@ -1,0 +1,13 @@
+[package]
+name = "katib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+katib-core.workspace = true
+katib-editor.workspace = true
+katib-sync.workspace = true
+# syntect: markdown highlighting in raw mode.
+gpui-kit = { workspace = true, features = ["syntect"] }
+notify = "8"
