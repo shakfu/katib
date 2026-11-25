@@ -19,7 +19,10 @@ pub use index::{
     Backlink, Broken, Hit, Index, IndexError, NoteRow, Problem, Recent, Stats, Suggestion,
     TagCount, Target, TaskRow,
 };
-pub use manage::{ManageError, Moved, move_folder, move_note, retarget, trash_note, untitled_id};
+pub use manage::{
+    ManageError, Moved, move_folder, move_note, preview_move_folder, preview_move_note, retarget,
+    trash_note, untitled_id,
+};
 pub use note::{Item, Link, LinkKind, Note, heading_offset, parse, text_links};
 pub use vault::{Entry, Vault, VaultError};
-pub use write::{SaveError, save_guarded, write_atomic};
+pub use write::{SaveError, autosave_due, save_guarded, write_atomic};

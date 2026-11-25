@@ -6,7 +6,20 @@ use std::{
     fs::{self, File},
     io::{self, Write as _},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
+
+/// Autosave after this long without typing.
+pub const IDLE: Duration = Duration::from_secs(1);
+/// Autosave at least this often while typing continues.
+pub const MAX_UNSAVED: Duration = Duration::from_secs(10);
+
+/// Whether an autosave is due at `now`, for a buffer last changed at
+/// `last_change` and holding unsaved edits since `dirty_since`.
+pub fn autosave_due(now: Instant, last_change: Instant, dirty_since: Option<Instant>) -> bool {
+    now.duration_since(last_change) >= IDLE
+        || dirty_since.is_some_and(|t| now.duration_since(t) >= MAX_UNSAVED)
+}
 
 #[derive(Debug)]
 pub enum SaveError {
@@ -73,6 +86,18 @@ pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::test_dir::TempDir;
+
+    #[test]
+    fn autosave_waits_for_a_pause_but_not_forever() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(!autosave_due(t0 + ms(900), t0, Some(t0)));
+        assert!(autosave_due(t0 + ms(1000), t0, Some(t0)));
+        // Typing every half second still saves after ten seconds.
+        let last = t0 + ms(9_800);
+        assert!(!autosave_due(t0 + ms(9_900), last, Some(t0)));
+        assert!(autosave_due(t0 + ms(10_000), last, Some(t0)));
+    }
 
     #[test]
     fn saves_when_the_disk_matches() {

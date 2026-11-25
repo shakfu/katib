@@ -19,7 +19,7 @@ Built in Rust on [gpui-kit](https://gpui-kit.com). Runs on macOS, Linux and Wind
 
 ### Editing
 
-- **Live mode** (default): formatted text; markdown syntax shows only on the caret's block.
+- **Live mode** (default): formatted text, tables included; markdown syntax shows only on the caret's block. Front matter is hidden until the caret enters it.
 
 - **Raw mode**: highlighted markdown source. Switching keeps the caret position.
 
@@ -49,7 +49,9 @@ Built in Rust on [gpui-kit](https://gpui-kit.com). Runs on macOS, Linux and Wind
 
 - Create, rename, move and delete notes; rename or move folders.
 
-- A move rewrites every link to the moved notes, including reference-style definitions, and rebases the moved notes' own relative links.
+- A move rewrites every link to the moved notes, including reference-style definitions, and rebases the moved notes' own relative links. The rename dialog lists the notes it will rewrite before you confirm.
+
+- **Folder pages**: a folder's `README.md` is its page. `[[folder]]`, `[[folder/]]` and a markdown link to `folder/` open it, as on GitHub. In the tree, clicking the folder opens its page, which is not listed among the folder's notes. "Create folder page" in a folder's menu adds one.
 
 - Delete moves the note to `.katib/trash/`.
 

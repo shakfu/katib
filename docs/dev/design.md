@@ -74,7 +74,7 @@ Chosen libraries, each with the alternative it beat:
 
 One buffer, two presentations of it:
 
-- **Live** (default). Formatted text. Markdown syntax on the cursor's block stays visible and editable. Elsewhere it is hidden or drawn as its result: a heading at its size, a link as its label, a checkbox as a box, an image inline.
+- **Live** (default). Formatted text. Markdown syntax on the cursor's block stays visible and editable. Elsewhere it is hidden or drawn as its result: a heading at its size, a link as its label, a checkbox as a box, an image inline, a table as a grid. Front matter is hidden until the caret enters it (Up from the first line). HTML and footnote definitions stay raw.
 - **Raw.** The markdown source with highlighting, in gpui-kit's `Editor`.
 
 The toggle is per window, with a default in the machine settings. Switching keeps the cursor at the same byte offset. Both modes edit the same text, so a save writes exactly what the user typed, never a re-serialization.
@@ -220,9 +220,10 @@ Live mode draws local images; remote images stay alt text, since fetching them w
 
 As in gwiki, by reference to `~/projects/personal/gwiki/docs/dev/wiki-design.md`:
 
-- `[[Title]]`, `[[path#Heading|label]]`, and relative markdown links. Resolution order: path, then title, then file name; an ambiguous link lists its candidates.
+- `[[Title]]`, `[[path#Heading|label]]`, and relative markdown links. Resolution order: path, then folder page, then title, then file name; an ambiguous link lists its candidates.
+- A folder's `README.md` is its page. `[[dir]]`, `[[dir/]]` and a markdown link to `dir` or `dir/` reach it. A note `dir.md` wins over `dir/README.md` for `[[dir]]`; `[[dir/]]` names only the page. A missing `[[dir/]]` creates `dir/README.md`.
 - The index holds notes, headings, links, tags and the FTS5 text. It re-reads a file whose size or modification time differs, and rebuilds when its schema version differs, so it is never synced. The window reads it while a background thread syncs it (SQLite WAL).
-- Moving a note rewrites every link to it, in one commit. Wiki links take the new file name when it is unambiguous, else the full path; a link by an explicit title still resolves and is left alone. The moved note's own relative links, images included, are rebased onto its new folder. Reference-style links are rewritten in their definition line. Moving a folder moves every file in it, and rewrites links into it from outside, including images. Each rewritten file is written with the same guard as a save. A move waits while a sync runs, so its writes land in one cycle.
+- Moving a note rewrites every link to it, in one commit. Wiki links take the new file name when it is unambiguous, else the full path; a link by an explicit title still resolves and is left alone. The moved note's own relative links, images included, are rebased onto its new folder. Reference-style links are rewritten in their definition line. Moving a folder moves every file in it, and rewrites links into it from outside, including images. A link written as a folder stays a folder link when its page moves. The rename dialog previews the notes a move will rewrite, computed by the same code with nothing written. Each rewritten file is written with the same guard as a save. A move waits while a sync runs, so its writes land in one cycle.
 - Deleting a note moves it to `.katib/trash/` (gitignored), keeping its folder; sync then commits the deletion. Folders emptied by a move or delete are removed.
 
 ## 8. The window

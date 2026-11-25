@@ -3,7 +3,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     rc::Rc,
     sync::{
@@ -25,7 +25,9 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
-use katib_core::{Backlink, Index, Link, NoteRow, Target, Vault, config::Config};
+use katib_core::{
+    Backlink, Index, Link, NoteRow, Target, Vault, config::Config, paths::page_folder,
+};
 use notify::Watcher as _;
 
 use crate::pane::Mode;
@@ -268,6 +270,8 @@ pub struct Katib {
     /// The window's connection; a background sync uses its own.
     index: Rc<RefCell<Index>>,
     notes: Vec<NoteRow>,
+    /// Each folder's page by folder path, from `folder_pages`.
+    pages: HashMap<String, String>,
     tree: Entity<TreeState>,
     /// Open folders, by tree id; the tree forgets them when its items are replaced.
     expanded: HashSet<String>,
@@ -367,6 +371,7 @@ impl Katib {
             config,
             index: Rc::new(RefCell::new(index)),
             notes: Vec::new(),
+            pages: HashMap::new(),
             tree,
             expanded: HashSet::new(),
             tabs: Vec::new(),
@@ -414,7 +419,8 @@ impl Katib {
                 // A folder that is gone must not come back expanded.
                 let dirs = folder_keys(&notes);
                 self.expanded.retain(|k| dirs.contains(k));
-                let items = build_tree(&notes, &self.expanded);
+                self.pages = folder_pages(&notes);
+                let items = build_tree(&notes, &self.pages, &self.expanded);
                 self.tree.update(cx, |t, cx| t.set_items(items, cx));
                 self.notes = notes;
             }
@@ -431,7 +437,13 @@ impl Katib {
             .and_then(|id| index.note_tags(id).ok())
             .unwrap_or_default();
         drop(index);
-        let item = open.map(|id| TreeItem::new(note_key(&id), ""));
+        // A folder page has no row of its own; its folder's row stands for it.
+        let item = open.map(|id| match page_folder(&id) {
+            Some(dir) if self.pages.get(dir) == Some(&id) => {
+                TreeItem::new(format!("dir:{dir}"), "")
+            }
+            _ => TreeItem::new(note_key(&id), ""),
+        });
         self.tree
             .update(cx, |t, cx| t.set_selected_item(item.as_ref(), cx));
         cx.notify();
@@ -557,8 +569,7 @@ impl Katib {
 
     /// Create a note titled after its id's last part, then open it.
     fn create(&mut self, id: &str, new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let title = id.rsplit('/').next().unwrap_or(id).trim();
-        let text = format!("# {title}\n\n");
+        let text = format!("# {}\n\n", new_note_title(id));
         match self.vault.create(id, &text) {
             Ok(entry) => {
                 if let Err(e) = self.index.borrow_mut().update(&entry, &text) {
@@ -976,9 +987,39 @@ fn move_expanded(expanded: &mut HashSet<String>, from: &str, to: &str) {
     }
 }
 
+/// The heading a new note `id` starts with: its file name, or for a folder
+/// page, its folder's name.
+fn new_note_title(id: &str) -> &str {
+    let name = page_folder(id).unwrap_or(id);
+    name.rsplit('/').next().unwrap_or(name).trim()
+}
+
+/// Each folder's page (`dir/README`, any case) by folder path. A folder with
+/// two pages differing in case has none, as `[[dir/]]` is ambiguous there.
+fn folder_pages(notes: &[NoteRow]) -> HashMap<String, String> {
+    let mut pages: HashMap<String, Option<String>> = HashMap::new();
+    for note in notes {
+        if let Some(dir) = page_folder(&note.id) {
+            pages
+                .entry(dir.to_owned())
+                .and_modify(|p| *p = None)
+                .or_insert(Some(note.id.clone()));
+        }
+    }
+    pages
+        .into_iter()
+        .filter_map(|(dir, page)| Some((dir, page?)))
+        .collect()
+}
+
 /// The vault as folders and notes. Folders come first, then notes by title.
-/// Keys carry a prefix, since `a.md` and the folder `a/` can both exist.
-fn build_tree(notes: &[NoteRow], expanded: &HashSet<String>) -> Vec<TreeItem> {
+/// Keys carry a prefix, since `a.md` and the folder `a/` can both exist. A
+/// folder's page is left out: the folder's row opens it.
+fn build_tree(
+    notes: &[NoteRow],
+    pages: &HashMap<String, String>,
+    expanded: &HashSet<String>,
+) -> Vec<TreeItem> {
     #[derive(Default)]
     struct Dir<'a> {
         dirs: BTreeMap<&'a str, Dir<'a>>,
@@ -1012,6 +1053,14 @@ fn build_tree(notes: &[NoteRow], expanded: &HashSet<String>) -> Vec<TreeItem> {
     }
     let mut root = Dir::default();
     for note in notes {
+        if page_folder(&note.id).is_some_and(|d| pages.get(d) == Some(&note.id)) {
+            // The folder still needs its row.
+            let mut dir = &mut root;
+            for part in note.id.split('/').take(note.id.split('/').count() - 1) {
+                dir = dir.dirs.entry(part).or_default();
+            }
+            continue;
+        }
         let mut dir = &mut root;
         let mut parts: Vec<&str> = note.id.split('/').collect();
         parts.pop();
@@ -1026,7 +1075,10 @@ fn build_tree(notes: &[NoteRow], expanded: &HashSet<String>) -> Vec<TreeItem> {
 #[cfg(test)]
 mod tests {
     // Not a glob: `gpui_kit::*` would bring GPUI's own `test` macro in.
-    use super::{HashSet, NoteRow, TreeItem, build_tree, folder_keys, move_expanded};
+    use super::{
+        HashMap, HashSet, NoteRow, TreeItem, build_tree, folder_keys, folder_pages, move_expanded,
+        new_note_title,
+    };
 
     fn row(id: &str, title: &str) -> NoteRow {
         NoteRow {
@@ -1054,7 +1106,7 @@ mod tests {
             row("a/c/d", "Deep"),
         ];
         let expanded = HashSet::from(["dir:a".to_owned()]);
-        let items = build_tree(&notes, &expanded);
+        let items = build_tree(&notes, &HashMap::new(), &expanded);
         assert_eq!(
             shape(&items),
             [
@@ -1079,5 +1131,39 @@ mod tests {
         let mut dirs: Vec<_> = dirs.into_iter().collect();
         dirs.sort();
         assert_eq!(dirs, ["dir:w", "dir:w/p", "dir:w/p/q"]);
+    }
+
+    #[test]
+    fn a_folder_page_hides_behind_its_folder_row() {
+        let notes = [
+            row("p/README", "Projects"),
+            row("p/a", "A"),
+            row("q/readme", "Q"),
+            row("r/README", "R1"),
+            row("r/readme", "R2"),
+            row("README", "Root"),
+        ];
+        let pages = folder_pages(&notes);
+        let mut listed: Vec<_> = pages.iter().map(|(d, p)| format!("{d}={p}")).collect();
+        listed.sort();
+        // `r` has two pages differing in case, so neither is its page.
+        assert_eq!(listed, ["p=p/README", "q=q/readme"]);
+        let items = build_tree(&notes, &pages, &HashSet::new());
+        assert_eq!(
+            shape(&items),
+            [
+                "dir:p [note:p/a=A]",
+                "dir:q=q",
+                "dir:r [note:r/README=R1, note:r/readme=R2]",
+                "note:README=Root",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_folder_page_is_titled_by_its_folder() {
+        assert_eq!(new_note_title("journal/2026-11-25"), "2026-11-25");
+        assert_eq!(new_note_title("a/projects/README"), "projects");
+        assert_eq!(new_note_title("README"), "README");
     }
 }

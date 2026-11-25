@@ -17,13 +17,8 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
-use katib_core::{Entry, Index, Link, SaveError, Vault, attach, save_guarded};
+use katib_core::{Entry, Index, Link, SaveError, Vault, attach, autosave_due, save_guarded};
 use katib_editor::{EditorEvent, LiveEditor};
-
-/// Save after this long without typing.
-const IDLE: Duration = Duration::from_secs(1);
-/// Save at least this often while typing continues.
-const MAX_UNSAVED: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -335,8 +330,7 @@ impl NotePane {
                         .timer(Duration::from_millis(250))
                         .await;
                     let done = this.update(cx, |this, cx| {
-                        let due = this.last_change.elapsed() >= IDLE
-                            || this.dirty_since.is_some_and(|t| t.elapsed() >= MAX_UNSAVED);
+                        let due = autosave_due(Instant::now(), this.last_change, this.dirty_since);
                         if due {
                             this.save_scheduled = false;
                             this.save(cx);

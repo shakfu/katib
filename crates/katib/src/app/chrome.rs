@@ -1,5 +1,8 @@
 //! The window's layout: toolbar, sidebar, tabs, the note with its backlinks,
 //! and the status bar.
+//!
+//! The title bar's title sits outside both toolbars. A `Toolbar` prevents the
+//! default of every press on it, which stops the title bar moving the window.
 
 use super::*;
 use gpui_kit::component::{
@@ -17,7 +20,7 @@ use gpui_kit::component::{
 };
 
 impl Katib {
-    /// The toolbar, with `title` between its groups. It sits in the title bar.
+    /// Two toolbars with `title` between them, for the title bar.
     fn toolbar(&self, title: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let note_open = !self.tabs.is_empty();
         let mode = self.pane().map_or(self.mode, |p| p.read(cx).mode());
@@ -26,9 +29,7 @@ impl Katib {
         let button = |id: &'static str, icon: IconName, tip: &'static str| {
             Button::new(id).ghost().icon(icon).tooltip(tip)
         };
-        Toolbar::new("toolbar")
-            .flex_1()
-            .min_w_0()
+        let left = Toolbar::new("toolbar")
             .small()
             .child(
                 ToolbarGroup::new("view")
@@ -75,17 +76,17 @@ impl Katib {
                             .on_click(cx.listener(|this, _, w, cx| this.open_tasks(w, cx))),
                     ),
             )
-            .content(self.calendar_button(cx))
-            .content(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_center()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .truncate()
-                    .child(title.to_owned()),
-            )
+            .content(self.calendar_button(cx));
+        let title = div()
+            .flex_1()
+            .min_w_0()
+            .text_center()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .truncate()
+            .child(title.to_owned());
+        let right = Toolbar::new("toolbar-note")
+            .small()
             .child(
                 ToolbarGroup::new("note")
                     .label("Note")
@@ -142,7 +143,14 @@ impl Katib {
                             )
                             .menu_with_icon("Sync now", IconName::RefreshCw, Box::new(SyncNow))
                     }),
-            )
+            );
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(left)
+            .child(title)
+            .child(right)
     }
 
     /// The overview's tab, then one tab per open note.
@@ -195,14 +203,28 @@ impl Katib {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let menu_view = view.clone();
+        // Folder pages by tree key: a folder's row opens its page.
+        let pages: Rc<HashMap<String, String>> = Rc::new(
+            self.pages
+                .iter()
+                .map(|(dir, page)| (format!("dir:{dir}"), page.clone()))
+                .collect(),
+        );
+        let menu_pages = pages.clone();
         tree(&self.tree, move |ix, entry, selected, _, _| {
             let item = entry.item();
-            let icon = match (entry.is_folder(), entry.is_expanded()) {
+            // A folder holding only its page has no children, but is still a folder.
+            let folder = item.id.starts_with("dir:");
+            let icon = match (folder, entry.is_expanded()) {
                 (false, _) => IconName::File,
                 (true, true) => IconName::FolderOpen,
                 (true, false) => IconName::Folder,
             };
-            let note = item.id.strip_prefix("note:").map(str::to_owned);
+            let note = item
+                .id
+                .strip_prefix("note:")
+                .map(str::to_owned)
+                .or_else(|| pages.get(item.id.as_ref()).cloned());
             ListItem::new(ix)
                 .w_full()
                 .py_0p5()
@@ -218,7 +240,8 @@ impl Katib {
                 })
         })
         .context_menu(move |_, entry, menu, _, _| {
-            Katib::tree_menu(&menu_view, &entry.item().id, menu)
+            let id = &entry.item().id;
+            Katib::tree_menu(&menu_view, id, menu_pages.get(id.as_ref()).cloned(), menu)
         })
         .text_sm()
         .p_1()

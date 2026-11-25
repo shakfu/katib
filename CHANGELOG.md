@@ -4,7 +4,7 @@ All notable changes to katib. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Design detail is in
 [docs/dev/design.md](docs/dev/design.md).
 
-## Unreleased
+## 0.2.0
 
 ### Added
 
@@ -13,6 +13,12 @@ All notable changes to katib. The format follows
 - **Attachments.** Paste or drop images and files, or use "Attach file...". Files are stored under `attachments/<hash>/` named by SHA-256, so the same bytes are stored once; files over 50 MB are refused. "Remove unused attachments..." moves unlinked files to the trash. Remote images are not fetched, so reading a note tells no server.
 
 - **Git LFS backend.** With `[objects] backend = "lfs"`, attachments are committed as LFS pointers. Sync fast-forwards with `GIT_LFS_SKIP_SMUDGE=1` and then runs `git lfs pull`, so an unreachable LFS server delays attachments but not notes. Turning LFS on moves already-committed attachments to LFS on the next commit, without rewriting history. Sync stays off if git-lfs is missing, rather than committing attachments as plain files.
+
+- **Folder pages.** A folder's `README.md` is its page, and folder links reach it as GitHub renders them; the rules are in [design.md section 7](docs/dev/design.md#7-links-and-the-index). In the tree, clicking a folder opens its page, which is not listed as a child. The folder's menu creates, renames or deletes the page. A link that matched a note by title or file name, such as `[[folder]]` reaching `other/folder.md`, moves to the page once `folder/README.md` exists.
+
+- **Tables and front matter in live mode.** GFM tables draw as grids, with links and emphasis in cells. Front matter is hidden until the caret enters it; Up from the first line reaches it. In a table, write a wiki link label as `[[Page\|label]]`, since a bare `|` splits the cell; links read and moves keep that form.
+
+- **Move preview.** The rename dialog lists the notes a move will rewrite, or why it would be refused, as you type.
 
 - **Tabs.** One tab per open note, each with its own autosave and back/forward history (ctrl-- and ctrl-shift-- on macOS, alt-left and alt-right elsewhere). The first tab is a fixed overview.
 
@@ -34,11 +40,13 @@ All notable changes to katib. The format follows
 
 ### Changed
 
-- Search weights a match in the title (10) over a heading or tag (5) over body text (1). The index schema is now version 3; each vault's index rebuilds on first open.
+- Search weights a match in the title (10) over a heading or tag (5) over body text (1). The index schema is now version 4; each vault's index rebuilds on first open.
 
 - `.katib/config.toml` is read in one place, `katib_core::config`. An unknown backend value is reported, not guessed at.
 
 ### Fixed
+
+- A push rejected on every cycle made sync retry about twice a second, with no limit. That happens when fetch and push reach different remotes, for example with a `pushurl` set. Sync now retries a rejected push at once up to 3 times in a row, then backs off as it does offline, and the status bar says so.
 
 - After a folder move, the sidebar kept expansion state for the old path, and a folder that later reappeared at that path opened expanded. Expansion now follows the move, and state for vanished folders is dropped.
 

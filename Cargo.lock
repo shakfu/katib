@@ -3731,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "katib"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -3745,7 +3745,7 @@ dependencies = [
 
 [[package]]
 name = "katib-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pulldown-cmark",
  "rusqlite",
@@ -3754,7 +3754,7 @@ dependencies = [
 
 [[package]]
 name = "katib-editor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui-kit",
  "katib-core",
@@ -3763,7 +3763,7 @@ dependencies = [
 
 [[package]]
 name = "katib-sync"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "khronos-egl"

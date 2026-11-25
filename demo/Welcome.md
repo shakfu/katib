@@ -8,6 +8,7 @@ katib keeps notes as markdown files in a folder. This folder is a demo vault.
 - A wiki link with a label: [[projects/katib|the katib project]]
 - A link to a heading: [[Editing#Undo]]
 - A markdown link: [sync notes](projects/sync.md)
+- A folder link, which opens the folder's README: [[projects]]
 - A link to a note that does not exist yet (cmd-click creates it): [[Ideas]]
 - A bare URL: https://github.com/longbridge/gpui-kit
 - An email address: someone@example.com

@@ -9,9 +9,9 @@ use std::{
 };
 
 use crate::{
-    Index, IndexError, Link, LinkKind, SaveError, Target, Vault, VaultError,
+    Entry, Index, IndexError, Link, LinkKind, SaveError, Target, Vault, VaultError,
     note::parse,
-    paths::{percent_decode, percent_encode, relative_path, relative_to},
+    paths::{page_folder, percent_decode, percent_encode, relative_path, relative_to},
     save_guarded,
 };
 
@@ -64,8 +64,8 @@ impl From<IndexError> for ManageError {
 
 type Result<T> = std::result::Result<T, ManageError>;
 
-/// What a move changed.
-#[derive(Debug, PartialEq, Eq)]
+/// What a move changed, or for a preview, would change.
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Moved {
     /// Each moved note, old id to new id.
     pub notes: Vec<(String, String)>,
@@ -115,6 +115,9 @@ impl Plan {
             return Some(format!("{to}.md"));
         }
         let (from, to) = self.folder.as_ref()?;
+        if path == from {
+            return Some(to.clone());
+        }
         path.strip_prefix(from.as_str())
             .and_then(|rest| rest.strip_prefix('/'))
             .map(|rest| format!("{to}/{rest}"))
@@ -124,28 +127,10 @@ impl Plan {
 /// Move (or rename) note `from` to id `to`, rewriting links. The index must be
 /// current; sync it afterwards.
 pub fn move_note(vault: &Vault, index: &Index, from: &str, to: &str) -> Result<Moved> {
-    let from = vault.entry(from)?;
-    let to = vault.entry(to)?;
-    if !from.path.is_file() {
-        return Err(VaultError::Io(from.path.clone(), io::ErrorKind::NotFound.into()).into());
-    }
-    // A case-only rename names the same file on a case-insensitive disk.
-    let same_file = from.path.canonicalize().ok() == to.path.canonicalize().ok();
-    if to.path.exists() && !same_file {
-        return Err(VaultError::Exists(to.id).into());
-    }
-    if from.id == to.id {
-        return Ok(Moved {
-            notes: Vec::new(),
-            rewritten: Vec::new(),
-        });
-    }
-    let plan = Plan::new(
-        index,
-        HashMap::from([(from.id.clone(), to.id.clone())]),
-        None,
-    )?;
-    let rewritten = rewrite_all(vault, index, &plan)?;
+    let Some((from, to, plan)) = plan_note(vault, index, from, to)? else {
+        return Ok(Moved::default());
+    };
+    let rewritten = write_edits(vault, &plan, edits(vault, index, &plan)?)?;
     if let Some(dir) = to.path.parent() {
         fs::create_dir_all(dir).map_err(|e| ManageError::Io(dir.to_owned(), e))?;
     }
@@ -158,9 +143,68 @@ pub fn move_note(vault: &Vault, index: &Index, from: &str, to: &str) -> Result<M
     })
 }
 
+/// What [`move_note`] would change, refused for the same reasons, writing nothing.
+pub fn preview_move_note(vault: &Vault, index: &Index, from: &str, to: &str) -> Result<Moved> {
+    match plan_note(vault, index, from, to)? {
+        Some((_, _, plan)) => preview(vault, index, plan),
+        None => Ok(Moved::default()),
+    }
+}
+
+/// The checked entries and plan for a note move; `None` if it moves nowhere.
+fn plan_note(
+    vault: &Vault,
+    index: &Index,
+    from: &str,
+    to: &str,
+) -> Result<Option<(Entry, Entry, Plan)>> {
+    let from = vault.entry(from)?;
+    let to = vault.entry(to)?;
+    if !from.path.is_file() {
+        return Err(VaultError::Io(from.path.clone(), io::ErrorKind::NotFound.into()).into());
+    }
+    // A case-only rename names the same file on a case-insensitive disk.
+    let same_file = from.path.canonicalize().ok() == to.path.canonicalize().ok();
+    if to.path.exists() && !same_file {
+        return Err(VaultError::Exists(to.id).into());
+    }
+    if from.id == to.id {
+        return Ok(None);
+    }
+    let notes = HashMap::from([(from.id.clone(), to.id.clone())]);
+    let plan = Plan::new(index, notes, None)?;
+    Ok(Some((from, to, plan)))
+}
+
 /// Move folder `from` (a vault path) to `to`, with every file in it, rewriting
 /// links to anything inside and the moved notes' own relative links.
 pub fn move_folder(vault: &Vault, index: &Index, from: &str, to: &str) -> Result<Moved> {
+    let (from_dir, to_dir, plan) = plan_folder(vault, index, from, to)?;
+    let rewritten = write_edits(vault, &plan, edits(vault, index, &plan)?)?;
+    if let Some(parent) = to_dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| ManageError::Io(parent.to_owned(), e))?;
+    }
+    fs::rename(&from_dir, &to_dir).map_err(|e| ManageError::Io(from_dir.clone(), e))?;
+    move_drafts(vault, &plan)?;
+    remove_empty_dirs(vault.root(), from_dir.parent());
+    let mut notes: Vec<_> = plan.notes.into_iter().collect();
+    notes.sort();
+    Ok(Moved { notes, rewritten })
+}
+
+/// What [`move_folder`] would change, refused for the same reasons, writing nothing.
+pub fn preview_move_folder(vault: &Vault, index: &Index, from: &str, to: &str) -> Result<Moved> {
+    let (_, _, plan) = plan_folder(vault, index, from, to)?;
+    preview(vault, index, plan)
+}
+
+/// The checked directories and plan for a folder move.
+fn plan_folder(
+    vault: &Vault,
+    index: &Index,
+    from: &str,
+    to: &str,
+) -> Result<(PathBuf, PathBuf, Plan)> {
     let (from, to) = (folder(vault, from)?, folder(vault, to)?);
     let (from_dir, to_dir) = (vault.root().join(&from), vault.root().join(&to));
     if !from_dir.is_dir() {
@@ -181,14 +225,15 @@ pub fn move_folder(vault: &Vault, index: &Index, from: &str, to: &str) -> Result
             Some((e.id.clone(), format!("{to}/{rest}")))
         })
         .collect();
-    let plan = Plan::new(index, notes, Some((from.clone(), to.clone())))?;
-    let rewritten = rewrite_all(vault, index, &plan)?;
-    if let Some(parent) = to_dir.parent() {
-        fs::create_dir_all(parent).map_err(|e| ManageError::Io(parent.to_owned(), e))?;
-    }
-    fs::rename(&from_dir, &to_dir).map_err(|e| ManageError::Io(from_dir.clone(), e))?;
-    move_drafts(vault, &plan)?;
-    remove_empty_dirs(vault.root(), from_dir.parent());
+    let plan = Plan::new(index, notes, Some((from, to)))?;
+    Ok((from_dir, to_dir, plan))
+}
+
+fn preview(vault: &Vault, index: &Index, plan: Plan) -> Result<Moved> {
+    let rewritten = edits(vault, index, &plan)?
+        .into_keys()
+        .filter(|id| !plan.notes.contains_key(id))
+        .collect();
     let mut notes: Vec<_> = plan.notes.into_iter().collect();
     notes.sort();
     Ok(Moved { notes, rewritten })
@@ -212,10 +257,8 @@ fn move_drafts(vault: &Vault, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite every note whose links the plan changes, each written only if it
-/// still holds what was read. Moving notes are written at their old paths;
-/// the caller then moves the files. Returns the non-moving notes rewritten.
-fn rewrite_all(vault: &Vault, index: &Index, plan: &Plan) -> Result<Vec<String>> {
+/// Every note whose links the plan changes: its text as read and as rewritten.
+fn edits(vault: &Vault, index: &Index, plan: &Plan) -> Result<BTreeMap<String, (String, String)>> {
     let mut sources: BTreeMap<String, ()> = BTreeMap::new();
     for id in plan.notes.keys() {
         sources.insert(id.clone(), ());
@@ -228,7 +271,7 @@ fn rewrite_all(vault: &Vault, index: &Index, plan: &Plan) -> Result<Vec<String>>
             sources.insert(src, ());
         }
     }
-    let mut edits: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut edits = BTreeMap::new();
     for src in sources.into_keys() {
         let path = vault.entry(&src)?.path;
         let Ok(text) = fs::read_to_string(&path) else {
@@ -239,6 +282,17 @@ fn rewrite_all(vault: &Vault, index: &Index, plan: &Plan) -> Result<Vec<String>>
             edits.insert(src, (text, new));
         }
     }
+    Ok(edits)
+}
+
+/// Write `edits`, each only if the note still holds what was read. Moving
+/// notes are written at their old paths; the caller then moves the files.
+/// Returns the non-moving notes rewritten.
+fn write_edits(
+    vault: &Vault,
+    plan: &Plan,
+    edits: BTreeMap<String, (String, String)>,
+) -> Result<Vec<String>> {
     let mut done = Vec::new();
     // Other notes first, then the moving ones, so a failure leaves no note moved.
     let order = edits
@@ -318,7 +372,11 @@ pub fn retarget(vault: &Vault, index: &Index, src: &str, link: &Link, to: &str) 
 fn wiki_reference(text: &str, link: &Link, new: &str) -> (std::ops::Range<usize>, String) {
     let inner_start = link.range.start + 2;
     let inner = &text[inner_start..link.range.end - 2];
-    let reference_len = inner.find(['#', '|']).unwrap_or(inner.len());
+    let mut reference_len = inner.find(['#', '|']).unwrap_or(inner.len());
+    // Keep the `\` of a table's `\|`.
+    if inner[reference_len..].starts_with('|') && inner[..reference_len].ends_with('\\') {
+        reference_len -= 1;
+    }
     (inner_start..inner_start + reference_len, new.to_owned())
 }
 
@@ -336,6 +394,16 @@ fn rewrite(text: &str, src: &str, index: &Index, plan: &Plan) -> Result<String> 
         match link.kind {
             LinkKind::Wiki => {
                 if let Some((from, to)) = moved_note
+                    && let Some(new) = folder_form(link.target.trim(), from, to)
+                {
+                    // Where a note holds the folder's path, name the page in full.
+                    let new = if names_a_note(index, &new)? {
+                        to.clone()
+                    } else {
+                        new
+                    };
+                    replacements.push(wiki_reference(text, &link, &new));
+                } else if let Some((from, to)) = moved_note
                     && let Some(r) =
                         wiki_replacement(text, &link, index, from, to, &plan.wiki_targets[from])?
                 {
@@ -346,14 +414,29 @@ fn rewrite(text: &str, src: &str, index: &Index, plan: &Plan) -> Result<String> 
                 let Some(old) = relative_path(src, &link.target) else {
                     continue;
                 };
-                let new = match moved_note {
-                    Some((_, to)) => format!("{to}.md"),
-                    None => plan.new_path(&old).unwrap_or(old),
+                let folder = moved_note.and_then(|(from, to)| {
+                    let written = link.target.trim_start_matches('/');
+                    let rel = old.clone() + if written.ends_with('/') { "/" } else { "" };
+                    folder_form(&rel, from, to)
+                });
+                let new = match (moved_note, folder) {
+                    (_, Some(dir)) => dir,
+                    (Some((_, to)), None) => format!("{to}.md"),
+                    (None, None) => plan.new_path(&old).unwrap_or(old),
                 };
-                let written = if link.target.starts_with('/') {
-                    format!("/{new}")
+                let written = match relative_to(new_src, &new) {
+                    _ if link.target.starts_with('/') => format!("/{new}"),
+                    // The note's own folder, as a relative link.
+                    w if w.is_empty() => "./".to_owned(),
+                    w => w,
+                };
+                let written = if link.target.ends_with('/')
+                    && !written.ends_with('/')
+                    && !new.ends_with(".md")
+                {
+                    written + "/"
                 } else {
-                    relative_to(new_src, &new)
+                    written
                 };
                 if written == percent_decode(&link.target) {
                     continue;
@@ -375,6 +458,28 @@ fn rewrite(text: &str, src: &str, index: &Index, plan: &Plan) -> Result<String> 
         out.replace_range(range, &new);
     }
     Ok(out)
+}
+
+/// Whether wiki link `[[reference]]` matches a note by path, which would win
+/// over a folder page there. `dir/` names only the page.
+fn names_a_note(index: &Index, reference: &str) -> Result<bool> {
+    if reference.ends_with('/') {
+        return Ok(false);
+    }
+    Ok(!index
+        .ids_where("id_key", &reference.to_lowercase())?
+        .is_empty())
+}
+
+/// How a link written as folder `written` (`dir` or `dir/`, a vault path)
+/// names page `from` after it moves to `to`. `None` if it names the page some
+/// other way, or `to` is no folder's page.
+fn folder_form(written: &str, from: &str, to: &str) -> Option<String> {
+    let bare = written.trim_end_matches('/');
+    if !page_folder(from)?.eq_ignore_ascii_case(bare) {
+        return None;
+    }
+    Some(format!("{}{}", page_folder(to)?, &written[bare.len()..]))
 }
 
 /// Replace the reference part of `[[reference#fragment|label]]`, keeping the
@@ -737,6 +842,110 @@ mod tests {
             move_folder(&vault, &index, "q", "q/r/s"),
             Err(ManageError::Vault(VaultError::BadId(_)))
         ));
+    }
+
+    #[test]
+    fn folder_links_follow_a_moved_folder_page_as_folder_links() {
+        let (dir, vault, index) = setup(
+            "mv-page",
+            &[
+                ("p/README.md", "no heading\n"),
+                ("p/a.md", "[up](./) [[p]]\n"),
+                (
+                    "top.md",
+                    "[[p]] [[p/]] [[p/README]] [f](p/) [g](p) [h](p/README.md)\n",
+                ),
+            ],
+        );
+        move_folder(&vault, &index, "p", "q/r").unwrap();
+        assert_eq!(
+            read(&dir, "top.md"),
+            "[[q/r]] [[q/r/]] [[q/r/README]] [f](q/r/) [g](q/r) [h](q/r/README.md)\n"
+        );
+        assert_eq!(read(&dir, "q/r/a.md"), "[up](./) [[q/r]]\n");
+        // Renamed away from README, the note is no folder's page any more.
+        let mut index = index;
+        index.sync(&vault).unwrap();
+        move_note(&vault, &index, "q/r/README", "q/r/about").unwrap();
+        assert_eq!(
+            read(&dir, "top.md"),
+            "[[q/r/about]] [[q/r/about]] [[q/r/about]] [f](q/r/about.md) [g](q/r/about.md) [h](q/r/about.md)\n"
+        );
+    }
+
+    #[test]
+    fn a_folder_link_takes_the_full_path_where_a_note_holds_the_folder_path() {
+        let (dir, vault, index) = setup(
+            "mv-page-taken",
+            &[
+                ("p/README.md", ""),
+                ("q/r.md", ""),
+                ("top.md", "[[p]] [[p/]] [f](p/)\n"),
+            ],
+        );
+        move_folder(&vault, &index, "p", "q/r").unwrap();
+        // `[[q/r]]` would reach q/r.md; `[[q/r/]]` and `q/r/` reach only the page.
+        assert_eq!(read(&dir, "top.md"), "[[q/r/README]] [[q/r/]] [f](q/r/)\n");
+    }
+
+    #[test]
+    fn a_folder_link_without_a_page_follows_the_folder_and_keeps_its_slash() {
+        let (dir, vault, index) = setup(
+            "mv-dir-link",
+            &[
+                ("p/a.md", "[up](./) [same](../p/)\n"),
+                ("top.md", "[f](p/) [g](p)\n"),
+            ],
+        );
+        move_folder(&vault, &index, "p", "q").unwrap();
+        assert_eq!(read(&dir, "top.md"), "[f](q/) [g](q)\n");
+        assert_eq!(read(&dir, "q/a.md"), "[up](./) [same](./)\n");
+    }
+
+    #[test]
+    fn a_preview_lists_what_the_move_changes_and_writes_nothing() {
+        let files = [
+            ("p/a.md", "[[b]]\n"),
+            ("p/b.md", ""),
+            ("top.md", "[a](p/a.md)\n"),
+            ("by-name.md", "[[b]]\n"),
+            ("other.md", "[[top]]\n"),
+        ];
+        let (dir, vault, index) = setup("mv-preview", &files);
+        let note = preview_move_note(&vault, &index, "p/b", "c").unwrap();
+        let folder = preview_move_folder(&vault, &index, "p", "q").unwrap();
+        for (path, text) in files {
+            assert_eq!(read(&dir, path), text);
+        }
+        assert_eq!(note.rewritten, ["by-name", "p/a"]);
+        assert_eq!(folder.notes.len(), 2);
+        assert_eq!(move_note(&vault, &index, "p/b", "c").unwrap(), note);
+        let mut index = index;
+        index.sync(&vault).unwrap();
+        let folder = preview_move_folder(&vault, &index, "p", "q").unwrap();
+        assert_eq!(folder.rewritten, ["top"]);
+        assert_eq!(move_folder(&vault, &index, "p", "q").unwrap(), folder);
+        assert!(matches!(
+            preview_move_note(&vault, &index, "q/a", "top"),
+            Err(ManageError::Vault(VaultError::Exists(_)))
+        ));
+        assert_eq!(
+            preview_move_note(&vault, &index, "top", "top").unwrap(),
+            Moved::default()
+        );
+    }
+
+    #[test]
+    fn a_wiki_link_in_a_table_keeps_its_escaped_pipe() {
+        let (dir, vault, index) = setup(
+            "mv-table",
+            &[
+                ("old.md", ""),
+                ("s.md", "| a |\n|-|\n| [[old\\|label]] |\n"),
+            ],
+        );
+        move_note(&vault, &index, "old", "new").unwrap();
+        assert_eq!(read(&dir, "s.md"), "| a |\n|-|\n| [[new\\|label]] |\n");
     }
 
     #[test]

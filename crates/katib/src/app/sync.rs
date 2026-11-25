@@ -1,11 +1,7 @@
 //! Driving git sync from the window (design.md section 5): when to run a
 //! cycle, what the status bar says, and the conflict dialog.
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _,
@@ -17,16 +13,10 @@ use katib_core::{
     Vault,
     config::{Backend, Config},
 };
-use katib_sync::{Choice, Conflicts, Outcome, Repo, Report, Versions};
+use katib_sync::{Choice, Conflicts, Outcome, Repo, Report, Versions, schedule::Schedule};
 
 use super::{Katib, notify_error};
 
-/// Commit once the vault has been quiet this long.
-const QUIET: Duration = Duration::from_secs(30);
-/// Fetch at least this often.
-const FETCH_EVERY: Duration = Duration::from_secs(60);
-/// The longest wait between attempts while offline.
-const MAX_BACKOFF: Duration = Duration::from_secs(600);
 /// A conflict preview shows at most this many bytes of each side.
 const PREVIEW: usize = 4000;
 
@@ -36,11 +26,7 @@ pub(super) struct SyncState {
     off: Option<String>,
     host: String,
     busy: bool,
-    /// The vault changed since the last cycle began.
-    changed: bool,
-    last_change: Instant,
-    next_fetch: Instant,
-    backoff: Duration,
+    schedule: Schedule,
     report: Option<Report>,
     error: Option<String>,
     choices: HashMap<String, Choice>,
@@ -81,11 +67,8 @@ impl SyncState {
             off,
             host: katib_sync::hostname(),
             busy: false,
-            changed: false,
-            last_change: Instant::now(),
             // The first cycle runs as soon as the window is up.
-            next_fetch: Instant::now(),
-            backoff: Duration::ZERO,
+            schedule: Schedule::new(Instant::now()),
             report: None,
             error: None,
             choices: HashMap::new(),
@@ -98,12 +81,11 @@ impl SyncState {
     }
 
     pub(super) fn note_change(&mut self) {
-        self.changed = true;
-        self.last_change = Instant::now();
+        self.schedule.note_change(Instant::now());
     }
 
     pub(super) fn fetch_soon(&mut self) {
-        self.next_fetch = Instant::now();
+        self.schedule.fetch_soon(Instant::now());
     }
 
     fn conflicts(&self) -> Option<&Conflicts> {
@@ -119,7 +101,7 @@ impl SyncState {
     /// Commit what is saved, without the network; for closing the window.
     pub(super) fn commit_now(&self) {
         if let Some(repo) = &self.repo
-            && self.changed
+            && self.schedule.changed()
             && let Err(e) = repo.commit_all(&self.host)
         {
             eprintln!("katib: {e}");
@@ -146,6 +128,9 @@ impl SyncState {
                 Outcome::Synced => "synced".into(),
                 Outcome::NoRemote => "no remote; commits stay here".into(),
                 Outcome::Offline(_) => format!("offline, {} unpushed", r.ahead),
+                Outcome::Retry if self.schedule.retries_exhausted() => {
+                    "push keeps being rejected; retrying later".into()
+                }
                 Outcome::Retry => "remote moved; syncing again".into(),
                 Outcome::Conflicted(c) => format!("{} conflicts", c.paths.len()),
             },
@@ -164,8 +149,7 @@ impl Katib {
         if !self.all_saved(cx) {
             return;
         }
-        let commit_due = s.changed && s.last_change.elapsed() >= QUIET;
-        if commit_due || Instant::now() >= s.next_fetch {
+        if s.schedule.due(Instant::now()) {
             self.run_sync(cx);
         }
     }
@@ -176,7 +160,7 @@ impl Katib {
         };
         let host = self.sync.host.clone();
         self.sync.busy = true;
-        self.sync.changed = false;
+        self.sync.schedule.started();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -194,17 +178,7 @@ impl Katib {
         match result {
             Ok(report) => {
                 s.error = None;
-                s.next_fetch = match &report.outcome {
-                    Outcome::Offline(_) => {
-                        s.backoff = (s.backoff * 2).clamp(FETCH_EVERY, MAX_BACKOFF);
-                        now + s.backoff
-                    }
-                    Outcome::Retry => now,
-                    _ => {
-                        s.backoff = Duration::ZERO;
-                        now + FETCH_EVERY
-                    }
-                };
+                s.schedule.finished(Some(&report.outcome), now);
                 if matches!(report.outcome, Outcome::Conflicted(_)) {
                     s.choices.clear();
                 }
@@ -212,7 +186,7 @@ impl Katib {
             }
             Err(e) => {
                 s.error = Some(e.to_string());
-                s.next_fetch = now + FETCH_EVERY;
+                s.schedule.finished(None, now);
             }
         }
         cx.notify();

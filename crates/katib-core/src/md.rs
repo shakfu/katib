@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, LinkType, Options, Parser, Tag};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
@@ -34,7 +34,15 @@ pub enum Kind {
     },
     Rule,
     FrontMatter,
-    /// A block with no variant here: tables, HTML, footnote definitions.
+    /// A GFM table: its head (one row of cells), then its body rows.
+    Table {
+        aligns: Vec<Align>,
+    },
+    TableHead,
+    TableRow,
+    /// Holds inlines, as a paragraph does.
+    TableCell,
+    /// A block with no variant here: HTML, footnote definitions.
     Other,
     /// Adjacent text and soft breaks, merged; the value has escapes resolved.
     Text(String),
@@ -52,6 +60,15 @@ pub enum Kind {
     Break,
     /// An inline with no variant here (HTML, footnote references), shown as source.
     Raw,
+}
+
+/// A table column's alignment, from its delimiter row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    None,
+    Left,
+    Center,
+    Right,
 }
 
 impl Kind {
@@ -180,16 +197,26 @@ fn kind(tag: Tag) -> Kind {
             alt: String::new(),
         },
         Tag::MetadataBlock(_) => Kind::FrontMatter,
+        Tag::Table(aligns) => Kind::Table {
+            aligns: aligns
+                .into_iter()
+                .map(|a| match a {
+                    Alignment::None => Align::None,
+                    Alignment::Left => Align::Left,
+                    Alignment::Center => Align::Center,
+                    Alignment::Right => Align::Right,
+                })
+                .collect(),
+        },
+        Tag::TableHead => Kind::TableHead,
+        Tag::TableRow => Kind::TableRow,
+        Tag::TableCell => Kind::TableCell,
         Tag::Superscript | Tag::Subscript => Kind::Raw,
         Tag::HtmlBlock
         | Tag::FootnoteDefinition(_)
         | Tag::DefinitionList
         | Tag::DefinitionListTitle
-        | Tag::DefinitionListDefinition
-        | Tag::Table(_)
-        | Tag::TableHead
-        | Tag::TableRow
-        | Tag::TableCell => Kind::Other,
+        | Tag::DefinitionListDefinition => Kind::Other,
     }
 }
 
@@ -326,6 +353,41 @@ mod tests {
                 lang: Some("rust".into()),
                 value: "let a;\n".into()
             }
+        );
+    }
+
+    #[test]
+    fn tables_have_aligned_columns_and_inline_cells() {
+        let s = "| a | *b* |\n|:-|-:|\n| [[c]] | d |\n";
+        let table = &parse(s)[0];
+        assert_eq!(
+            table.kind,
+            Kind::Table {
+                aligns: vec![Align::Left, Align::Right]
+            }
+        );
+        let rows: Vec<Vec<String>> = table
+            .children
+            .iter()
+            .map(|row| {
+                row.children
+                    .iter()
+                    .map(|cell| format!("{:?} {}", cell.kind, s[cell.range.clone()].trim()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ["TableCell a", "TableCell *b*"],
+                ["TableCell [[c]]", "TableCell d"]
+            ]
+        );
+        assert_eq!(table.children[0].kind, Kind::TableHead);
+        assert_eq!(table.children[1].kind, Kind::TableRow);
+        assert_eq!(
+            table.children[0].children[1].children[0].kind,
+            Kind::Emphasis
         );
     }
 

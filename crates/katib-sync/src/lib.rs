@@ -6,6 +6,8 @@
 //! fast-forward, which git refuses if it would overwrite uncommitted changes.
 //! So a conflict never leaves markers on disk.
 
+pub mod schedule;
+
 use std::{
     ffi::OsStr,
     fmt, io,

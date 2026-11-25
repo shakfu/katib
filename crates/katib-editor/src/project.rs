@@ -8,10 +8,10 @@
 use std::ops::Range;
 
 use gpui_kit::base::text::editor_host::{
-    BlockNode, CodeBlock, ImageNode, InlineNode, LinkMark, Paragraph, TextMark,
+    BlockNode, CodeBlock, ColumnAlign, ImageNode, InlineNode, LinkMark, Paragraph, Table, TextMark,
 };
 use katib_core::LinkKind;
-use katib_core::md::{self, Kind, Node};
+use katib_core::md::{self, Align, Kind, Node};
 
 /// Where one keyed leaf's bytes come from in the source.
 #[derive(Clone, Debug, PartialEq)]
@@ -86,8 +86,18 @@ pub fn project(text: &str, head: Option<usize>) -> Projection {
     for (source, nodes) in segments(text, &root) {
         let active = head.is_some_and(|h| source.start <= h && h <= source.end);
         let first_leaf = out.leaves.len();
+        let front_matter = matches!(
+            nodes.as_slice(),
+            [Node {
+                kind: Kind::FrontMatter,
+                ..
+            }]
+        );
         let formatted = if active || nodes.is_empty() {
             None
+        } else if front_matter {
+            // Hidden until the caret enters it; Up on the first line reaches offset 0.
+            Some(Vec::new())
         } else {
             let mut cx = Cx {
                 text,
@@ -316,6 +326,23 @@ impl Cx<'_> {
                 )
             }
             Kind::Rule => BlockNode::HorizontalRule { span: None },
+            Kind::Table { aligns } => {
+                let rows = node
+                    .children
+                    .iter()
+                    .map(|row| row.children.iter().map(|c| self.paragraph(c)).collect())
+                    .collect();
+                let aligns = aligns
+                    .iter()
+                    .map(|a| match a {
+                        Align::None => ColumnAlign::None,
+                        Align::Left => ColumnAlign::Left,
+                        Align::Center => ColumnAlign::Center,
+                        Align::Right => ColumnAlign::Right,
+                    })
+                    .collect();
+                BlockNode::Table(Table::new(rows, aligns))
+            }
             _ => return None,
         })
     }
@@ -549,10 +576,44 @@ mod tests {
 
     #[test]
     fn unsupported_blocks_stay_raw() {
-        let text = "x\n\n| a |\n|---|\n| b |";
+        let text = "x\n\n<div>\nhi\n</div>";
         let p = project(text, Some(0));
         assert!(p.segments.last().unwrap().raw);
         assert_eq!(p.segments.last().unwrap().blocks.len(), 3);
+    }
+
+    #[test]
+    fn a_table_is_formatted_with_one_leaf_per_cell() {
+        let text = "x\n\n| a | **b** |\n|---|--:|\n| [[Page\\|c]] | d |";
+        let p = project(text, Some(0));
+        let table = p.segments.last().unwrap();
+        assert!(!table.raw);
+        let BlockNode::Table(t) = &table.blocks[0] else {
+            panic!("a table")
+        };
+        assert_eq!(t.column_aligns(), [ColumnAlign::None, ColumnAlign::Right]);
+        assert_eq!(t.rows().map(|r| r.count()).collect::<Vec<_>>(), [2, 2]);
+        // Cells map back past hidden markup: "b" and the label "c".
+        let cells = &p.leaves[p.leaves.len() - 4..];
+        assert_eq!(cells[1].to_source(0), text.find("b**").unwrap());
+        assert_eq!(cells[2].to_source(0), text.find("c]]").unwrap());
+        // With the caret in it, the table shows its pipes.
+        let raw = project(text, Some(text.find('d').unwrap()));
+        assert!(raw.segments.last().unwrap().raw);
+    }
+
+    #[test]
+    fn front_matter_hides_until_the_caret_enters_it() {
+        let text = "---\ntitle: T\n---\n\nbody";
+        let p = project(text, Some(text.len()));
+        let first = &p.segments[0];
+        assert_eq!(
+            (first.source.clone(), first.raw, first.blocks.len()),
+            (0..16, false, 0)
+        );
+        assert!(p.leaves.iter().all(|l| l.source.start > 16));
+        assert!(project(text, Some(0)).segments[0].raw);
+        assert!(project(text, None).segments[0].blocks.is_empty());
     }
 
     #[test]

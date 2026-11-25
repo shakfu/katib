@@ -377,7 +377,8 @@ fn wiki_links(text: &str, offset: usize, out: &mut Vec<Link>) {
             continue;
         }
         let (reference, label) = match inner.split_once('|') {
-            Some((r, l)) => (r, Some(l.trim().to_owned())),
+            // Inside a table, `\|` keeps the pipe from splitting the cell.
+            Some((r, l)) => (r.strip_suffix('\\').unwrap_or(r), Some(l.trim().to_owned())),
             None => (inner, None),
         };
         let (target, fragment) = match reference.split_once('#') {
@@ -466,6 +467,10 @@ mod tests {
                 ),
                 link(LinkKind::Wiki, "", Some("only"), None),
             ]
+        );
+        assert_eq!(
+            links("| [[Page#H\\|label]] |"),
+            vec![link(LinkKind::Wiki, "Page", Some("H"), Some("label"))]
         );
     }
 

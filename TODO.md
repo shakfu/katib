@@ -32,12 +32,12 @@ listed, marked, so the numbers hold.
    - latest: notes by last change, with the last commit's author;
    - tasks: item 4's view;
    - stats: orphans, dead ends, most-linked notes, tags.
-7. **Folder pages.** A folder's `README.md` is its page: `[[folder]]` and a
+7. **Done.** **Folder pages.** A folder's `README.md` is its page: `[[folder]]` and a
    link to `folder/` reach it, and the tree opens it from the folder's row.
 
 ## Moves and export
 
-8. **Preview a move.** The rename dialog lists the notes whose links it will
+8. **Done.** **Preview a move.** The rename dialog lists the notes whose links it will
    rewrite before confirming. gwiki: `mv --dry-run`.
 9. **Export for GitHub.** Write a copy of the vault with `[[wiki]]` links
    turned into markdown links, which GitHub renders. gwiki: `export`.

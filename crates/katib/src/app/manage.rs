@@ -11,10 +11,60 @@ use gpui_kit::component::{
     notification::Notification,
     v_flex,
 };
-use gpui_kit::*;
-use katib_core::{attach, move_folder, move_note, trash_note};
+use gpui_kit::{prelude::FluentBuilder as _, *};
+use katib_core::{
+    ManageError, Moved, attach, move_folder, move_note, preview_move_folder, preview_move_note,
+    trash_note,
+};
 
 use super::{Katib, notify_error};
+
+/// The name in the dialog's input, as a move or create takes it.
+fn typed_name(input: &Entity<InputState>, cx: &App) -> String {
+    input
+        .read(cx)
+        .value()
+        .trim()
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// Notes listed by name in a move preview; the rest are counted.
+const PREVIEW_NAMES: usize = 5;
+
+/// A move preview for the dialog, and whether it is an error.
+fn preview_text(result: Result<Moved, ManageError>) -> (String, bool) {
+    let moved = match result {
+        Ok(moved) => moved,
+        Err(e) => return (e.to_string(), true),
+    };
+    if moved.notes.is_empty() && moved.rewritten.is_empty() {
+        return (String::new(), false);
+    }
+    let notes = |n: usize| {
+        if n == 1 {
+            "1 note".to_owned()
+        } else {
+            format!("{n} notes")
+        }
+    };
+    let mut text = if moved.notes.len() > 1 {
+        format!("Moves {}. ", notes(moved.notes.len()))
+    } else {
+        String::new()
+    };
+    match moved.rewritten.as_slice() {
+        [] => text.push_str("No links to update."),
+        ids => {
+            let mut names = ids[..ids.len().min(PREVIEW_NAMES)].join(", ");
+            if ids.len() > PREVIEW_NAMES {
+                names.push_str(&format!(" and {} more", ids.len() - PREVIEW_NAMES));
+            }
+            text.push_str(&format!("Updates links in {}: {names}.", notes(ids.len())));
+        }
+    }
+    (text, false)
+}
 
 /// What a sidebar menu item does.
 type MenuAction = dyn Fn(&mut Katib, &mut Window, &mut Context<Katib>);
@@ -32,6 +82,8 @@ pub(super) enum Naming {
 pub(super) struct Prompt {
     input: Entity<InputState>,
     naming: Naming,
+    /// For a move: what it would change, and whether that is an error.
+    preview: (String, bool),
     _subscription: Subscription,
 }
 
@@ -81,17 +133,22 @@ impl Katib {
             _ => "A path in the vault, without .md. Folders are created as needed.",
         };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
-        let subscription =
-            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_name(window, cx);
-                }
-            });
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_name(window, cx),
+                InputEvent::Change => this.preview_move(cx),
+                _ => {}
+            },
+        );
         self.prompt = Some(Prompt {
             input: input.clone(),
             naming,
+            preview: (String::new(), false),
             _subscription: subscription,
         });
+        self.preview_move(cx);
         let this = cx.weak_entity();
         let focused = Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, _| {
@@ -107,13 +164,29 @@ impl Katib {
                             input.update(cx, |s, cx| s.focus(window, cx));
                         });
                     }
+                    let (preview, error) = this
+                        .upgrade()
+                        .and_then(|this| this.read(cx).prompt.as_ref().map(|p| p.preview.clone()))
+                        .unwrap_or_default();
+                    let theme = cx.theme();
                     content.child(
-                        v_flex().gap_2().child(Input::new(&input)).child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(hint),
-                        ),
+                        v_flex()
+                            .gap_2()
+                            .child(Input::new(&input))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(hint),
+                            )
+                            .when(!preview.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .text_sm()
+                                        .when(error, |d| d.text_color(theme.danger))
+                                        .child(preview),
+                                )
+                            }),
                     )
                 })
                 .footer(
@@ -134,17 +207,35 @@ impl Katib {
         });
     }
 
+    /// Show what the move typed so far would change.
+    fn preview_move(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = &self.prompt else {
+            return;
+        };
+        let name = typed_name(&prompt.input, cx);
+        let (vault, index) = (&self.vault, &self.index.borrow());
+        let preview = match &prompt.naming {
+            _ if name.is_empty() => (String::new(), false),
+            Naming::Move(from) | Naming::MoveFolder(from) if *from == name => {
+                (String::new(), false)
+            }
+            Naming::Move(from) => preview_text(preview_move_note(vault, index, from, &name)),
+            Naming::MoveFolder(from) => {
+                preview_text(preview_move_folder(vault, index, from, &name))
+            }
+            Naming::Create | Naming::Tags(_) => return,
+        };
+        if let Some(prompt) = &mut self.prompt {
+            prompt.preview = preview;
+        }
+        cx.notify();
+    }
+
     fn submit_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(prompt) = self.prompt.take() else {
             return;
         };
-        let name = prompt
-            .input
-            .read(cx)
-            .value()
-            .trim()
-            .trim_end_matches('/')
-            .to_owned();
+        let name = typed_name(&prompt.input, cx);
         window.close_dialog(cx);
         if let Naming::Tags(id) = &prompt.naming {
             return self.save_tags(id, &name, window, cx);
@@ -407,8 +498,14 @@ impl Katib {
         }
     }
 
-    /// The sidebar's right-click menu for tree item `key` (`note:<id>` or `dir:<path>`).
-    pub(super) fn tree_menu(view: &Entity<Katib>, key: &str, menu: PopupMenu) -> PopupMenu {
+    /// The sidebar's right-click menu for tree item `key` (`note:<id>` or
+    /// `dir:<path>`); `has_page` tells whether a folder has a page.
+    pub(super) fn tree_menu(
+        view: &Entity<Katib>,
+        key: &str,
+        page: Option<String>,
+        menu: PopupMenu,
+    ) -> PopupMenu {
         let item = |label: &'static str, f: Rc<MenuAction>| {
             let view = view.clone();
             PopupMenuItem::new(label).on_click(move |_, window, cx| {
@@ -432,7 +529,28 @@ impl Katib {
                 Rc::new(move |this, w, cx| this.confirm_delete(b.clone(), w, cx)),
             ))
         } else if let Some(dir) = key.strip_prefix("dir:") {
-            let (a, b) = (dir.to_owned(), dir.to_owned());
+            let (a, b, c) = (dir.to_owned(), dir.to_owned(), dir.to_owned());
+            // The page is not in the tree, so its own actions are here.
+            let menu = match page {
+                Some(page) => {
+                    let p = page.clone();
+                    menu.item(item(
+                        "Rename or move page...",
+                        Rc::new(move |this, w, cx| {
+                            this.prompt_name(Naming::Move(p.clone()), w, cx)
+                        }),
+                    ))
+                    .item(item(
+                        "Delete page...",
+                        Rc::new(move |this, w, cx| this.confirm_delete(page.clone(), w, cx)),
+                    ))
+                    .separator()
+                }
+                None => menu.item(item(
+                    "Create folder page",
+                    Rc::new(move |this, w, cx| this.create(&format!("{c}/README"), false, w, cx)),
+                )),
+            };
             menu.item(item(
                 "New note here...",
                 Rc::new(move |this, w, cx| this.prompt_new_in(&a, w, cx)),
@@ -444,5 +562,31 @@ impl Katib {
         } else {
             menu
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Moved, preview_text};
+
+    fn moved(notes: usize, rewritten: &[&str]) -> Moved {
+        Moved {
+            notes: (0..notes).map(|i| (i.to_string(), i.to_string())).collect(),
+            rewritten: rewritten.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn previews_name_the_first_notes_and_count_the_rest() {
+        let text = |n, r| preview_text(Ok(moved(n, r))).0;
+        assert_eq!(text(0, &[]), "");
+        // A folder of attachments moves no note but can rewrite links to it.
+        assert_eq!(text(0, &["a"]), "Updates links in 1 note: a.");
+        assert_eq!(text(1, &[]), "No links to update.");
+        assert_eq!(text(1, &["a"]), "Updates links in 1 note: a.");
+        assert_eq!(
+            text(3, &["a", "b", "c", "d", "e", "f", "g"]),
+            "Moves 3 notes. Updates links in 7 notes: a, b, c, d, e and 2 more."
+        );
     }
 }

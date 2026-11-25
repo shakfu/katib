@@ -56,6 +56,13 @@ pub fn relative_to(from: &str, path: &str) -> String {
     parts.join("/")
 }
 
+/// The folder whose page note `id` is: `dir` for `dir/README`, ignoring case.
+/// The vault root's README is no folder's page.
+pub fn page_folder(id: &str) -> Option<&str> {
+    let (dir, name) = id.rsplit_once('/')?;
+    name.eq_ignore_ascii_case("readme").then_some(dir)
+}
+
 /// Escape what would end or confuse a link destination written without `<>`.
 pub fn percent_encode(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
@@ -76,6 +83,14 @@ pub fn percent_encode(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_pages() {
+        assert_eq!(page_folder("a/b/README"), Some("a/b"));
+        assert_eq!(page_folder("a/readme"), Some("a"));
+        assert_eq!(page_folder("README"), None);
+        assert_eq!(page_folder("a/README-old"), None);
+    }
 
     #[test]
     fn relative_paths_round_trip() {

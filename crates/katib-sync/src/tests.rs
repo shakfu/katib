@@ -326,3 +326,40 @@ fn last_commits_name_the_newest_author_per_file() {
     let sub = a.root.join("dir");
     assert!(last_commits_with_env(&sub, 50, &env).is_empty());
 }
+
+#[test]
+fn a_push_rejected_by_a_moved_remote_retries_and_then_merges() {
+    let (f, a, b) = Fixture::new("rejected", &[("a.md", "a\n"), ("b.md", "b\n")]);
+    // A fetches from a copy taken before B pushes and pushes to the real
+    // remote, as if B pushed between A's fetch and A's push.
+    git(
+        &f.dir,
+        &["clone", "--quiet", "--bare", "remote.git", "stale.git"],
+    );
+    let url = |name: &str| f.dir.join(name).to_string_lossy().into_owned();
+    git(&a.root, &["remote", "set-url", "origin", &url("stale.git")]);
+    git(
+        &a.root,
+        &["remote", "set-url", "--push", "origin", &url("remote.git")],
+    );
+    write(&b, "b.md", "b from B\n");
+    assert_eq!(b.sync(true, "B").unwrap().outcome, Outcome::Synced);
+    write(&a, "a.md", "a from A\n");
+    let report = a.sync(true, "A").unwrap();
+    assert_eq!(
+        (report.committed, report.outcome, report.ahead),
+        (true, Outcome::Retry, 1)
+    );
+    git(
+        &a.root,
+        &["remote", "set-url", "origin", &url("remote.git")],
+    );
+    let report = a.sync(true, "A").unwrap();
+    assert_eq!(
+        (report.committed, report.outcome, report.ahead),
+        (false, Outcome::Synced, 0)
+    );
+    assert_eq!(read(&a, "b.md").as_deref(), Some("b from B\n"));
+    assert_eq!(b.sync(true, "B").unwrap().outcome, Outcome::Synced);
+    assert_eq!(read(&b, "a.md").as_deref(), Some("a from A\n"));
+}

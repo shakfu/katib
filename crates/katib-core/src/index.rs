@@ -9,12 +9,12 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::{
     Link, LinkKind, Vault, VaultError,
     note::{self, Note},
-    paths::relative_path,
+    paths::{page_folder, relative_path},
     vault::Entry,
 };
 
 /// Bump to rebuild every index on next open.
-const SCHEMA: i64 = 3;
+const SCHEMA: i64 = 4;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE notes (
@@ -43,7 +43,7 @@ CREATE TABLE links (
     label TEXT,
     start INTEGER NOT NULL,
     end INTEGER NOT NULL,
-    -- Wiki: the lower-cased target. Markdown: the lower-cased id it points to.
+    -- Wiki: the lower-cased target. Markdown: the lower-cased id or path it points to.
     key TEXT,
     -- The source line holding the link, for the backlinks panel.
     context TEXT NOT NULL
@@ -350,7 +350,14 @@ impl Index {
                     return Ok(Target::Invalid);
                 };
                 let Some(id) = path.strip_suffix(".md") else {
-                    return Ok(Target::File(path));
+                    // `dir` or `dir/` reaches the folder's page, if it has one.
+                    let page = format!("{}/readme", path.to_lowercase());
+                    let ids = self.ids_where("id_key", &page)?;
+                    return Ok(match ids.as_slice() {
+                        [] => Target::File(path),
+                        [one] => Target::Note(one.clone()),
+                        _ => Target::Ambiguous(ids),
+                    });
                 };
                 let ids = self.ids_where("id_key", &id.to_lowercase())?;
                 Ok(match ids.as_slice() {
@@ -362,22 +369,42 @@ impl Index {
         }
     }
 
-    /// By path, then title, then file name; case is ignored.
+    /// By path, then folder page (`dir/README` for `dir`), then title, then
+    /// file name; case is ignored.
     pub fn resolve_wiki(&self, target: &str) -> Result<Target> {
-        let key = target.trim().to_lowercase();
-        for column in ["id_key", "title_key", "name_key"] {
-            let mut ids = self.ids_where(column, &key)?;
+        let written = target.trim();
+        let folder = written.ends_with('/');
+        let name = written.trim_end_matches('/');
+        if name.is_empty() {
+            return Ok(Target::Invalid);
+        }
+        let key = name.to_lowercase();
+        let page = format!("{key}/readme");
+        let rules = [
+            ("id_key", &key),
+            ("id_key", &page),
+            ("title_key", &key),
+            ("name_key", &key),
+        ];
+        // `dir/` names only the folder's page.
+        let rules = if folder { &rules[1..2] } else { &rules[..] };
+        for &(column, key) in rules {
+            let mut ids = self.ids_where(column, key)?;
             match ids.len() {
                 0 => continue,
                 1 => return Ok(Target::Note(ids.remove(0))),
                 _ => return Ok(Target::Ambiguous(ids)),
             }
         }
-        Ok(Target::Missing(target.trim().to_owned()))
+        Ok(Target::Missing(if folder {
+            format!("{name}/README")
+        } else {
+            name.to_owned()
+        }))
     }
 
-    fn ids_where(&self, column: &str, key: &str) -> Result<Vec<String>> {
-        // `column` is one of three literals above, never input.
+    pub(crate) fn ids_where(&self, column: &str, key: &str) -> Result<Vec<String>> {
+        // `column` is always a literal, never input.
         let mut stmt = self.db.prepare_cached(&format!(
             "SELECT id FROM notes WHERE {column} = ?1 ORDER BY id"
         ))?;
@@ -700,7 +727,7 @@ impl Index {
         Ok(out)
     }
 
-    /// Notes with a markdown link or image into folder `dir`, by source id.
+    /// Notes with a markdown link or image to folder `dir` or into it, by source id.
     pub fn sources_linking_under(&self, dir: &str) -> Result<Vec<String>> {
         let prefix = format!("{dir}/");
         let mut stmt = self
@@ -710,7 +737,7 @@ impl Index {
         let mut out = Vec::new();
         for row in rows {
             let (src, target) = row?;
-            if relative_path(&src, &target).is_some_and(|p| p.starts_with(&prefix))
+            if relative_path(&src, &target).is_some_and(|p| p == dir || p.starts_with(&prefix))
                 && !out.contains(&src)
             {
                 out.push(src);
@@ -735,13 +762,15 @@ impl Index {
         let mut stmt = self.db.prepare(
             "SELECT l.src, n.title, l.kind, l.target, l.context
              FROM links l JOIN notes n ON n.id = l.src
-             WHERE l.key IN (?1, ?2, ?3) AND l.src != ?4
+             WHERE l.key IN (?1, ?2, ?3, ?5) AND l.src != ?4
              ORDER BY n.title, l.start",
         )?;
+        let folder = page_folder(id).unwrap_or(id).to_lowercase();
         let rows: Vec<(String, String, i64, String, String)> = stmt
-            .query_map(params![id.to_lowercase(), title_key, name_key, id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
+            .query_map(
+                params![id.to_lowercase(), title_key, name_key, id, folder],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?
             .collect::<rusqlite::Result<_>>()?;
         let mut out: Vec<Backlink> = Vec::new();
         for (src, title, kind, target, context) in rows {
@@ -857,9 +886,10 @@ fn put(
     )?;
     for link in &note.links {
         let key = match link.kind {
-            LinkKind::Wiki => Some(link.target.trim().to_lowercase()),
+            LinkKind::Wiki => Some(link.target.trim().trim_end_matches('/').to_lowercase()),
+            // A path without `.md` may name a folder, and so its page.
             LinkKind::Markdown => relative_path(&entry.id, &link.target)
-                .and_then(|p| p.strip_suffix(".md").map(str::to_lowercase)),
+                .map(|p| p.strip_suffix(".md").unwrap_or(&p).to_lowercase()),
             LinkKind::External => None,
         };
         insert.execute(params![
@@ -1049,6 +1079,89 @@ mod tests {
             ]
         );
         assert!(index.backlinks("self").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_folder_link_reaches_its_readme() {
+        let (d, _v, index) = vault(
+            "idx-folder",
+            &[
+                ("p/README.md", "# Projects\n"),
+                ("p/x.md", ""),
+                ("q.md", ""),
+                ("q/readme.md", ""),
+                (
+                    "r/n.md",
+                    "[up](../p/) [down](../p) [[p]] [[p/]] [[P/README]]",
+                ),
+            ],
+        );
+        let r = |t: &str| index.resolve("r/n", &wiki(t)).unwrap();
+        assert_eq!(r("p"), Target::Note("p/README".into()));
+        assert_eq!(r("p/"), Target::Note("p/README".into()));
+        // A note at the folder's path wins over the folder's page.
+        assert_eq!(r("q"), Target::Note("q".into()));
+        assert_eq!(r("q/"), Target::Note("q/readme".into()));
+        // A folder link names no title or file name, and a missing one names a page.
+        assert_eq!(r("Projects/"), Target::Missing("Projects/README".into()));
+        assert_eq!(r("x/"), Target::Missing("x/README".into()));
+        assert_eq!(r("/"), Target::Invalid);
+        let md = |t: &str| Link {
+            kind: LinkKind::Markdown,
+            ..wiki(t)
+        };
+        let m = |t: &str| index.resolve("r/n", &md(t)).unwrap();
+        assert_eq!(m("../p/"), Target::Note("p/README".into()));
+        assert_eq!(m("../p"), Target::Note("p/README".into()));
+        assert_eq!(m("../r/"), Target::File("r".into()));
+        let back: Vec<_> = index
+            .backlinks("p/README")
+            .unwrap()
+            .into_iter()
+            .map(|b| b.src)
+            .collect();
+        assert_eq!(back, ["r/n"]);
+        assert!(index.broken(&d.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_folder_with_two_pages_is_ambiguous_by_either_link() {
+        let (_d, _v, index) = vault(
+            "idx-two-pages",
+            &[("r/README.md", ""), ("r/readme.md", ""), ("n.md", "")],
+        );
+        // A case-insensitive file system holds only one of the two.
+        if index.ids_where("id_key", "r/readme").unwrap().len() < 2 {
+            return;
+        }
+        let both = Target::Ambiguous(vec!["r/README".into(), "r/readme".into()]);
+        assert_eq!(index.resolve("n", &wiki("r/")).unwrap(), both);
+        let md = Link {
+            kind: LinkKind::Markdown,
+            ..wiki("r/")
+        };
+        assert_eq!(index.resolve("n", &md).unwrap(), both);
+    }
+
+    #[test]
+    fn a_new_folder_page_wins_over_a_title_or_file_name_match() {
+        let (d, vault, mut index) = vault(
+            "idx-page-wins",
+            &[
+                ("notes/p.md", ""),
+                ("t.md", "# Q\n"),
+                ("x.md", "[[p]] [[q]]\n"),
+            ],
+        );
+        let r = |index: &Index, t: &str| index.resolve("x", &wiki(t)).unwrap();
+        assert_eq!(r(&index, "p"), Target::Note("notes/p".into()));
+        assert_eq!(r(&index, "q"), Target::Note("t".into()));
+        d.write("p/README.md", "");
+        d.write("q/README.md", "");
+        index.sync(&vault).unwrap();
+        // The page rule comes before title and file name (design.md section 8).
+        assert_eq!(r(&index, "p"), Target::Note("p/README".into()));
+        assert_eq!(r(&index, "q"), Target::Note("q/README".into()));
     }
 
     #[test]
