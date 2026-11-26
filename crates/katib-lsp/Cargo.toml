@@ -1,0 +1,11 @@
+[package]
+name = "katib-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No GPUI: `katib lsp` serves editors over stdio.
+[dependencies]
+katib-core.workspace = true
+anyhow = "1"
+serde_json = "1"

@@ -115,6 +115,8 @@ Opt-in per vault. katib commits, fetches, merges and pushes with the `git` binar
 
 - git-lfs, only for the LFS backend.
 
+- On Windows, CMake and NASM, to build aws-lc-rs, the TLS library the agent uses ([requirements](https://aws.github.io/aws-lc-rs/requirements/windows.html)).
+
 ## Usage
 
 ```sh
@@ -133,6 +135,54 @@ backend = "git"   # or "lfs"
 ```
 
 `.katib/config.toml` is committed, so every clone shares it. `.katib/cache/`, `drafts/` and `trash/` are ignored.
+
+### Outside agents (MCP)
+
+`katib mcp <vault>` serves the built-in agent's tools over MCP's stdio transport: `list`, `read`, `search`, `backlinks`, `write`, `edit`, `move` and `delete`. Replacing or deleting a note requires reading it first, and fails if it changed since. `delete` moves the note to `.katib/trash/`. `move` rewrites links across the vault. For Claude Code:
+
+```sh
+claude mcp add katib -- katib mcp ~/notes
+```
+
+The server writes files and does not commit them. With sync on, the window's next sync cycle commits them.
+
+### Outside agents in the panel (ACP)
+
+In Settings, Agent, choose Claude Code, Gemini CLI, minima or a custom command instead of the built-in agent. katib runs the command in the vault folder and speaks the [Agent Client Protocol](https://agentclientprotocol.com/protocol/) to it:
+
+| preset | command |
+|-|-|
+| Claude Code | `npx -y @agentclientprotocol/claude-agent-acp` |
+| Gemini CLI | `npx -y @google/gemini-cli --acp` |
+| minima | `minima --acp` |
+
+- The agent keeps its own sign-in, model and tools. Its tools can reach outside the vault.
+- katib answers the agent's file requests only inside the vault, outside hidden folders. A write to a file it read through katib fails if the file changed since.
+- Each session is offered `katib mcp <vault>`, so an agent with an MCP client also gets the note tools.
+- A permission request shows in the transcript with the agent's options. Stop or Escape cancels it with the prompt.
+
+An agent that needs a sign-in, such as Claude Code, needs it done once in a terminal.
+
+### Other editors (LSP)
+
+`katib lsp [vault]` is a language server for markdown files in a vault; without a vault argument it serves the folder the editor opens. It offers:
+
+- wiki link completion after `[[`
+- go to definition on a wiki or markdown link, to the note or its heading
+- broken links as warnings: no note, several notes, a missing file, or a path out of the vault
+- rename on a link to a note, which moves the note and rewrites every link to it
+
+Rename returns the edits and the file rename for the editor to apply; save the changed files afterwards. It is refused while a note it rewrites has unsaved changes, and in an editor that cannot rename files through LSP. For Helix, in `languages.toml`:
+
+```toml
+[language-server.katib]
+command = "katib"
+args = ["lsp"]
+
+[[language]]
+name = "markdown"
+language-servers = ["katib"]
+```
 
 ## Keys
 
@@ -167,7 +217,8 @@ make check   # rustfmt and clippy, warnings as errors
 | `katib-core` | vault, parsing, link resolution, index, guarded writes, moves, attachments, tasks |
 | `katib-editor` | the live mode editor element |
 | `katib-sync` | the git sync state machine |
-| `katib-agent` | the built-in agent: vault tools, keys and memory, and the thread it runs on, over `minima-core` |
+| `katib-lsp` | `katib lsp`: the language server, over `katib-core` |
+| `katib-agent` | the built-in agent: vault tools, keys and memory, and the thread it runs on, over `minima-core`; the MCP server and the ACP client |
 | `katib` | the app: window, tree, palette, tabs, dialogs |
 
 ## License

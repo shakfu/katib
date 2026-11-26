@@ -30,6 +30,36 @@ fn disk(dir: &Scratch, rel: &str) -> String {
 }
 
 #[test]
+fn a_delete_needs_a_read_of_the_current_text_and_names_links_left() {
+    let (dir, tools) = vault(
+        "delete",
+        &[
+            ("a.md", "# A\n"),
+            ("b.md", "[[a]] and [[a#x]]\n"),
+            ("c.md", "[[a]]\n"),
+        ],
+    );
+    let err = call(&tools, "delete", json!({ "note": "a" })).unwrap_err();
+    assert!(err.to_string().contains("read a before"), "{err}");
+
+    call(&tools, "read", json!({ "note": "a" })).unwrap();
+    fs::write(dir.file("a.md"), "# A\nedited elsewhere\n").unwrap();
+    let err = call(&tools, "delete", json!({ "note": "a" })).unwrap_err();
+    assert!(err.to_string().contains("changed since"), "{err}");
+    assert!(PathBuf::from(dir.file("a.md")).exists());
+
+    call(&tools, "read", json!({ "note": "a" })).unwrap();
+    let out = call(&tools, "delete", json!({ "note": "a" })).unwrap();
+    assert_eq!(out, "moved a to the trash; links to it remain in b, c");
+    assert!(!PathBuf::from(dir.file("a.md")).exists());
+    assert_eq!(disk(&dir, ".katib/trash/a.md"), "# A\nedited elsewhere\n");
+    let listed = call(&tools, "list", json!({})).unwrap();
+    assert!(!listed.contains("a - "), "{listed}");
+    let err = call(&tools, "delete", json!({ "note": "a" })).unwrap_err();
+    assert!(err.to_string().contains("no note a"), "{err}");
+}
+
+#[test]
 fn ids_that_leave_the_vault_are_refused() {
     let (dir, tools) = vault("escape", &[("a.md", "# A\n")]);
     fs::create_dir_all(dir.file(".git")).unwrap();
@@ -226,7 +256,8 @@ fn every_tool_advertises_an_object_schema() {
             "backlinks",
             "write",
             "edit",
-            "move"
+            "move",
+            "delete"
         ]
     );
     for spec in tools.specs() {

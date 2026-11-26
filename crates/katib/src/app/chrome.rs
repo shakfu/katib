@@ -89,6 +89,15 @@ impl Katib {
                         )),
                     )
                     .child(
+                        Button::new("new-folder")
+                            .ghost()
+                            .icon(Icon::new(gpui_kit::assets::IconName::FolderPlus))
+                            .tooltip("New folder")
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                this.prompt_name(manage::Naming::CreateFolder, w, cx)
+                            })),
+                    )
+                    .child(
                         button("tasks", IconName::CircleCheck, "Tasks")
                             .on_click(cx.listener(|this, _, w, cx| this.open_tasks(w, cx))),
                     ),
@@ -174,6 +183,16 @@ impl Katib {
                                 "Remove unused attachments...",
                                 IconName::Delete,
                                 Box::new(PruneAttachments),
+                            )
+                            .menu_with_icon(
+                                "Export vault for GitHub...",
+                                IconName::ExternalLink,
+                                Box::new(ExportForGithub),
+                            )
+                            .menu_with_icon(
+                                "Export vault as GitHub wiki...",
+                                IconName::ExternalLink,
+                                Box::new(ExportGithubWiki),
                             )
                             .menu_with_icon("Sync now", IconName::RefreshCw, Box::new(SyncNow))
                     }),

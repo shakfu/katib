@@ -73,6 +73,8 @@ type MenuAction = dyn Fn(&mut Katib, &mut Window, &mut Context<Katib>);
 #[derive(Clone)]
 pub(super) enum Naming {
     Create,
+    /// A folder, made with its page: git keeps no empty folder, and the tree lists notes.
+    CreateFolder,
     Move(String),
     MoveFolder(String),
     /// Edit note `id`'s tags.
@@ -97,6 +99,7 @@ impl Katib {
     ) {
         let (title, initial, ok) = match &naming {
             Naming::Create => ("New note", String::new(), "Create"),
+            Naming::CreateFolder => ("New folder", String::new(), "Create"),
             Naming::Move(id) => ("Rename or move note", id.clone(), "Rename"),
             Naming::MoveFolder(dir) => ("Rename or move folder", dir.clone(), "Rename"),
             Naming::Tags(id) => {
@@ -119,6 +122,26 @@ impl Katib {
         );
     }
 
+    /// Ask for a folder name in folder `dir`.
+    fn prompt_folder_in(&mut self, dir: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_with(
+            Naming::CreateFolder,
+            "New folder",
+            format!("{dir}/"),
+            "Create",
+            window,
+            cx,
+        );
+    }
+
+    /// Create folder `path` with its page, `path/README.md`, and open the page.
+    fn create_folder(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match new_folder_page(&self.vault, path) {
+            Ok(page) => self.create(&page, false, window, cx),
+            Err(e) => notify_error(window, cx, e),
+        }
+    }
+
     fn prompt_with(
         &mut self,
         naming: Naming,
@@ -130,6 +153,10 @@ impl Katib {
     ) {
         let hint = match naming {
             Naming::Tags(_) => "Separated by commas. Empty removes every tag.",
+            Naming::CreateFolder => {
+                "A path in the vault. The folder is created with its page, README.md, which \
+                 keeps it in the tree and in sync."
+            }
             _ => "A path in the vault, without .md. Folders are created as needed.",
         };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
@@ -223,7 +250,7 @@ impl Katib {
             Naming::MoveFolder(from) => {
                 preview_text(preview_move_folder(vault, index, from, &name))
             }
-            Naming::Create | Naming::Tags(_) => return,
+            Naming::Create | Naming::CreateFolder | Naming::Tags(_) => return,
         };
         if let Some(prompt) = &mut self.prompt {
             prompt.preview = preview;
@@ -245,6 +272,7 @@ impl Katib {
         }
         match prompt.naming {
             Naming::Create => self.create(&name, false, window, cx),
+            Naming::CreateFolder => self.create_folder(&name, window, cx),
             Naming::Move(from) => self.move_to(&from, &name, false, window, cx),
             Naming::MoveFolder(from) => self.move_to(&from, &name, true, window, cx),
             Naming::Tags(_) => {}
@@ -551,9 +579,14 @@ impl Katib {
                     Rc::new(move |this, w, cx| this.create(&format!("{c}/README"), false, w, cx)),
                 )),
             };
+            let d = dir.to_owned();
             menu.item(item(
                 "New note here...",
                 Rc::new(move |this, w, cx| this.prompt_new_in(&a, w, cx)),
+            ))
+            .item(item(
+                "New folder here...",
+                Rc::new(move |this, w, cx| this.prompt_folder_in(&d, w, cx)),
             ))
             .item(item(
                 "Rename or move folder...",
@@ -565,15 +598,39 @@ impl Katib {
     }
 }
 
+/// The page id for a new folder at `path`, refused if the path is no valid folder or exists.
+fn new_folder_page(vault: &katib_core::Vault, path: &str) -> Result<String, String> {
+    let path = path.trim().trim_matches('/');
+    let page = vault
+        .entry(&format!("{path}/README"))
+        .map_err(|e| e.to_string())?;
+    if page.path.parent().is_some_and(|dir| dir.exists()) {
+        return Err(format!("A folder named {path:?} exists"));
+    }
+    Ok(page.id)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Moved, preview_text};
+    use super::{Moved, new_folder_page, preview_text};
 
     fn moved(notes: usize, rewritten: &[&str]) -> Moved {
         Moved {
             notes: (0..notes).map(|i| (i.to_string(), i.to_string())).collect(),
             rewritten: rewritten.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn a_new_folder_is_its_page_and_never_an_existing_folder() {
+        let root = std::env::temp_dir().join(format!("katib-new-folder-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("old")).unwrap();
+        let vault = katib_core::Vault::open(&root).unwrap();
+        let page = |p: &str| new_folder_page(&vault, p);
+        assert_eq!(page(" a/b/ "), Ok("a/b/README".into()));
+        assert_eq!(page("old"), Err("A folder named \"old\" exists".into()));
+        assert!(page("").is_err() && page(".hidden").is_err() && page("../out").is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
