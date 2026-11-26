@@ -2,8 +2,7 @@
 
 A desktop notes app with wiki links. Notes are markdown files in a folder (a vault). katib syncs the vault across machines through git.
 
-Built in Rust on [gpui-kit](https://gpui-kit.com). Runs on macOS, Linux and Windows. Design: [docs/dev/design.md](docs/dev/design.md). Changes:
-[CHANGELOG.md](CHANGELOG.md).
+Built in Rust on [gpui-kit](https://gpui-kit.com). Runs on macOS, Linux and Windows. Design: [docs/dev/design.md](docs/dev/design.md). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Principles
 
@@ -157,8 +156,11 @@ In Settings, Agent, choose Claude Code, Gemini CLI, minima or a custom command i
 | minima | `minima --acp` |
 
 - The agent keeps its own sign-in, model and tools. Its tools can reach outside the vault.
+
 - katib answers the agent's file requests only inside the vault, outside hidden folders. A write to a file it read through katib fails if the file changed since.
+
 - Each session is offered `katib mcp <vault>`, so an agent with an MCP client also gets the note tools.
+
 - A permission request shows in the transcript with the agent's options. Stop or Escape cancels it with the prompt.
 
 An agent that needs a sign-in, such as Claude Code, needs it done once in a terminal.
@@ -168,8 +170,11 @@ An agent that needs a sign-in, such as Claude Code, needs it done once in a term
 `katib lsp [vault]` is a language server for markdown files in a vault; without a vault argument it serves the folder the editor opens. It offers:
 
 - wiki link completion after `[[`
+
 - go to definition on a wiki or markdown link, to the note or its heading
+
 - broken links as warnings: no note, several notes, a missing file, or a path out of the vault
+
 - rename on a link to a note, which moves the note and rewrites every link to it
 
 Rename returns the edits and the file rename for the editor to apply; save the changed files afterwards. It is refused while a note it rewrites has unsaved changes, and in an editor that cannot rename files through LSP. For Helix, in `languages.toml`:

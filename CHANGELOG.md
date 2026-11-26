@@ -1,8 +1,6 @@
 # Changelog
 
-All notable changes to katib. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Design detail is in
-[docs/dev/design.md](docs/dev/design.md).
+All notable changes to katib. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Design detail is in [docs/dev/design.md](docs/dev/design.md).
 
 ## 0.2.0
 
