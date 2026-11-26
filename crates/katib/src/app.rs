@@ -30,6 +30,7 @@ use katib_core::{
 };
 use notify::Watcher as _;
 
+use crate::agent::{AgentPanel, OpenNote};
 use crate::pane::Mode;
 
 mod chrome;
@@ -75,6 +76,7 @@ actions!(
         EditTags,
         BrowseTags,
         ShowOverview,
+        ToggleAgent,
     ]
 );
 
@@ -105,6 +107,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(key!("shift-d"), OpenToday, c),
         KeyBinding::new(key!("\\"), ToggleSidebar, c),
         KeyBinding::new(key!("shift-b"), ToggleBacklinks, c),
+        KeyBinding::new(key!("shift-a"), ToggleAgent, c),
         KeyBinding::new(key!("q"), Quit, None),
         // VS Code's keys: cmd-[ is outdent in the raw editor, alt-left a word move on macOS.
         #[cfg(target_os = "macos")]
@@ -163,6 +166,7 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Toggle Raw Markdown", ToggleMode),
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Toggle Backlinks", ToggleBacklinks),
+            MenuItem::action("Toggle Agent", ToggleAgent),
             MenuItem::separator(),
             MenuItem::action("Next Tab", NextTab),
             MenuItem::action("Previous Tab", PrevTab),
@@ -208,6 +212,7 @@ fn commands(note_open: bool) -> Vec<(&'static str, IconName, Box<dyn Action>)> {
             Box::new(ShowOverview),
         ),
         ("Tasks...", IconName::CircleCheck, Box::new(OpenTasks)),
+        ("Toggle agent", IconName::Bot, Box::new(ToggleAgent)),
         ("Tags...", IconName::Star, Box::new(BrowseTags)),
         (
             "Broken links...",
@@ -312,6 +317,9 @@ pub struct Katib {
     /// Whether the backlinks panel is expanded; collapsed at start.
     backlinks_open: bool,
     sidebar_open: bool,
+    /// The agent panel, on the right; its session starts when it first opens.
+    agent: Entity<AgentPanel>,
+    agent_open: bool,
     calendar: Entity<CalendarState>,
     calendar_open: bool,
     /// The window title last given to the OS.
@@ -351,6 +359,7 @@ impl Katib {
             }
         };
         let tree = cx.new(|cx| TreeState::new(cx));
+        let agent = cx.new(|cx| AgentPanel::new(vault.clone(), window, cx));
         let calendar = cx.new(|cx| CalendarState::new(window, cx));
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
@@ -366,6 +375,9 @@ impl Katib {
                 }
             }),
             cx.subscribe_in(&calendar, window, Self::calendar_event),
+            cx.subscribe_in(&agent, window, |this, _, OpenNote(id), window, cx| {
+                this.open(id, window, cx);
+            }),
         ];
         window.on_window_should_close(cx, {
             let this = cx.weak_entity();
@@ -405,6 +417,8 @@ impl Katib {
             prompt: None,
             backlinks_open: false,
             sidebar_open: true,
+            agent,
+            agent_open: false,
             calendar,
             calendar_open: false,
             window_title: String::new(),
@@ -877,6 +891,7 @@ impl Katib {
                 this.backlinks_open = !this.backlinks_open;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ToggleAgent, w, cx| this.toggle_agent(w, cx)))
             .on_action(cx.listener(|this, _: &SyncNow, w, cx| this.sync_now(w, cx)))
             .on_action(cx.listener(|this, _: &AttachFile, w, cx| this.pick_attachments(w, cx)))
             .on_action(cx.listener(|this, _: &RenameNote, w, cx| {

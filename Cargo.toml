@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/katib-core", "crates/katib-editor", "crates/katib-sync", "crates/katib"]
+members = [
+    "crates/katib-core",
+    "crates/katib-editor",
+    "crates/katib-sync",
+    "crates/katib-agent",
+    "crates/katib",
+]
 
 [workspace.package]
 version = "0.2.0"
@@ -11,6 +17,10 @@ license = "MIT"
 katib-core = { path = "crates/katib-core" }
 katib-editor = { path = "crates/katib-editor" }
 katib-sync = { path = "crates/katib-sync" }
+katib-agent = { path = "crates/katib-agent" }
+# Providers and the agent loop. To build against a minima checkout instead, add
+# `[patch.crates-io] minima-core = { path = "../minima/crates/minima-core" }`.
+minima-core = "0.7.1"
 # Pinned to the minor: gpui-kit is pre-1.0 and pins an exact GPUI snapshot.
 gpui-kit = "=0.11.0"
 sha2 = "0.11"

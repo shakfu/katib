@@ -167,6 +167,7 @@ make check   # rustfmt and clippy, warnings as errors
 | `katib-core` | vault, parsing, link resolution, index, guarded writes, moves, attachments, tasks |
 | `katib-editor` | the live mode editor element |
 | `katib-sync` | the git sync state machine |
+| `katib-agent` | the built-in agent: vault tools, keys and memory, and the thread it runs on, over `minima-core` |
 | `katib` | the app: window, tree, palette, tabs, dialogs |
 
 ## License

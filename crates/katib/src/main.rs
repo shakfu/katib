@@ -1,5 +1,6 @@
 //! katib: a desktop notes app over a folder of markdown files.
 
+mod agent;
 mod app;
 mod complete;
 mod pane;

@@ -20,6 +20,23 @@ use gpui_kit::component::{
 };
 
 impl Katib {
+    /// Show or hide the agent panel. Opening it starts its session the first time and tells the
+    /// agent today's date and where daily notes go.
+    pub(super) fn toggle_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_open = !self.agent_open;
+        if self.agent_open {
+            let today = jiff::ZonedDateTime::now().date();
+            let extra = format!(
+                "Today is {today}. Daily notes are `{}/YYYY-MM-DD`.",
+                self.config.journal
+            );
+            self.agent.update(cx, |a, cx| a.open(extra, window, cx));
+        } else {
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
+    }
+
     /// Two toolbars with `title` between them, for the title bar.
     fn toolbar(&self, title: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let note_open = !self.tabs.is_empty();
@@ -103,6 +120,11 @@ impl Katib {
                             })
                             .tooltip("Toggle raw markdown")
                             .on_click(cx.listener(|this, _, w, cx| this.toggle_mode(w, cx))),
+                    )
+                    .child(
+                        button("agent", IconName::Bot, "Toggle agent")
+                            .selected(self.agent_open)
+                            .on_click(cx.listener(|this, _, w, cx| this.toggle_agent(w, cx))),
                     )
                     .child(
                         button("settings", IconName::Settings, "Settings")
@@ -366,13 +388,25 @@ impl Render for Katib {
             .size_full()
             .child(self.tab_bar(cx))
             .child(div().flex_1().min_h_0().child(self.editor(cx)));
-        let body = if self.sidebar_open {
-            h_resizable("main")
-                .child(resizable_panel().size(px(240.)).child(self.sidebar(cx)))
-                .child(resizable_panel().child(main))
-                .into_any_element()
-        } else {
-            main.into_any_element()
+        // Each arrangement has its own id, so a panel's width is kept per arrangement.
+        let body = match (self.sidebar_open, self.agent_open) {
+            (false, false) => main.into_any_element(),
+            (sidebar, agent) => {
+                let id = match (sidebar, agent) {
+                    (true, false) => "main",
+                    (false, true) => "main-agent",
+                    _ => "main-sidebar-agent",
+                };
+                h_resizable(id)
+                    .when(sidebar, |r| {
+                        r.child(resizable_panel().size(px(240.)).child(self.sidebar(cx)))
+                    })
+                    .child(resizable_panel().child(main))
+                    .when(agent, |r| {
+                        r.child(resizable_panel().size(px(380.)).child(self.agent.clone()))
+                    })
+                    .into_any_element()
+            }
         };
         let root = v_flex()
             .size_full()
