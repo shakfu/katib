@@ -55,6 +55,8 @@ Built in Rust on [gpui-kit](https://gpui-kit.com). Runs on macOS, Linux and Wind
 
 - Delete moves the note to `.katib/trash/`.
 
+- **Export** a note with [Quarto](https://quarto.org) to HTML, PDF, Word, EPUB or GitHub markdown. "Run and export" also runs its R or Python code cells.
+
 - **Tabs**, each with its own autosave and back/forward history. The first tab is a fixed overview.
 
 - **Daily notes** at `<journal folder>/YYYY-MM-DD.md`, from the toolbar calendar.

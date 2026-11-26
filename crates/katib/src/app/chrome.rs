@@ -135,6 +135,18 @@ impl Katib {
                                 Box::new(DeleteNote),
                                 !note_open,
                             )
+                            .menu_with_icon_and_disabled(
+                                "Export note...",
+                                IconName::ExternalLink,
+                                Box::new(ExportNote),
+                                !note_open,
+                            )
+                            .menu_with_icon_and_disabled(
+                                "Run and export note...",
+                                IconName::ExternalLink,
+                                Box::new(RunAndExportNote),
+                                !note_open,
+                            )
                             .separator()
                             .menu_with_icon(
                                 "Remove unused attachments...",
@@ -341,7 +353,10 @@ impl Katib {
             }
             None => bar = bar.left("Overview. cmd-p: open, search or create a note"),
         }
-        bar.when(self.syncing, |b| b.right("indexing")).right(sync)
+        let export = self.export_status(cx);
+        bar.when(self.syncing, |b| b.right("indexing"))
+            .when_some(export, |b, e| b.right(e))
+            .right(sync)
     }
 }
 

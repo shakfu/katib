@@ -3,6 +3,7 @@
 pub mod attach;
 pub mod complete;
 pub mod config;
+pub mod export;
 pub mod front;
 mod index;
 mod manage;

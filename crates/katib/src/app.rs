@@ -33,6 +33,7 @@ use notify::Watcher as _;
 use crate::pane::Mode;
 
 mod chrome;
+mod export;
 mod journal;
 mod links;
 mod manage;
@@ -65,6 +66,8 @@ actions!(
         RenameNote,
         DeleteNote,
         PruneAttachments,
+        ExportNote,
+        RunAndExportNote,
         GoBack,
         GoForward,
         BrokenLinks,
@@ -146,6 +149,8 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Attach File...", AttachFile),
             MenuItem::action("Rename or Move...", RenameNote),
             MenuItem::action("Delete...", DeleteNote),
+            MenuItem::action("Export...", ExportNote),
+            MenuItem::action("Run and Export...", RunAndExportNote),
             MenuItem::separator(),
             MenuItem::action("Edit Tags...", EditTags),
             MenuItem::action("Tasks...", OpenTasks),
@@ -234,6 +239,16 @@ fn commands(note_open: bool) -> Vec<(&'static str, IconName, Box<dyn Action>)> {
                 Box::new(RenameNote),
             ),
             ("Delete note...", IconName::Delete, Box::new(DeleteNote)),
+            (
+                "Export note...",
+                IconName::ExternalLink,
+                Box::new(ExportNote),
+            ),
+            (
+                "Run and export note...",
+                IconName::ExternalLink,
+                Box::new(RunAndExportNote),
+            ),
             ("Save", IconName::Check, Box::new(Save)),
             ("Close tab", IconName::Close, Box::new(CloseTab)),
             ("Edit tags...", IconName::Star, Box::new(EditTags)),
@@ -307,6 +322,7 @@ pub struct Katib {
     /// The tasks dialog's rows, while it is open.
     tasks: Vec<katib_core::TaskRow>,
     tasks_show_done: bool,
+    exporting: Option<export::Exporting>,
     /// The active note's tags.
     note_tags: Vec<String>,
     /// The broken links dialog's rows, while it is open.
@@ -397,6 +413,7 @@ impl Katib {
             overview: overview::Overview::default(),
             tasks: Vec::new(),
             tasks_show_done: false,
+            exporting: None,
             note_tags: Vec::new(),
             settings_error: None,
             focus: cx.focus_handle(),
@@ -873,6 +890,10 @@ impl Katib {
                 }
             }))
             .on_action(cx.listener(|this, _: &PruneAttachments, w, cx| this.confirm_prune(w, cx)))
+            .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.prompt_export(false, w, cx)))
+            .on_action(
+                cx.listener(|this, _: &RunAndExportNote, w, cx| this.prompt_export(true, w, cx)),
+            )
             .on_action(cx.listener(|this, _: &GoBack, w, cx| this.go(true, w, cx)))
             .on_action(cx.listener(|this, _: &GoForward, w, cx| this.go(false, w, cx)))
             .on_action(cx.listener(|this, _: &BrokenLinks, w, cx| this.open_broken(w, cx)))

@@ -107,7 +107,7 @@ pub fn heading_offset(source: &str, fragment: &str) -> Option<usize> {
 
 /// GitHub-style heading slug: lower case, spaces and hyphens to `-`, other
 /// punctuation dropped.
-fn slug(text: &str) -> String {
+pub(crate) fn slug(text: &str) -> String {
     text.chars()
         .filter_map(|c| match c {
             c if c.is_alphanumeric() || c == '_' => Some(c.to_lowercase().next().unwrap_or(c)),

@@ -246,6 +246,7 @@ Built from gpui-kit 0.11.0 components:
 - `Command` as the palette: open a note, search, create, or run a command. A command row shows its key binding.
 - `StatusBar`: the note, its save state, words, indexing, and the sync state, which runs a cycle when clicked.
 - `Settings` in a `Dialog`: sync on or off, the attachment backend, the journal folder. They are written to `.katib/config.toml`, so they are committed with the vault; changing sync or the backend restarts sync.
+- Export: "Export note..." renders the open note with Quarto to HTML, PDF (Typst), Word, EPUB or GitHub markdown, in `.katib/out/` (gitignored), and opens the file. "Run and export note..." also runs its code cells. Running is a separate command because synced notes can carry other people's code. `.katib/quarto.yml` holds vault-wide defaults, which a note's front matter overrides. Staging and the engine rules are in `katib_core::export`'s module docs.
 - `AlertDialog` to confirm deletes; `Dialog` for names and conflicts.
 - A menu bar whose items dispatch the same actions as the keys: native on macOS, which keeps the system's menu search, shortcut rebinding and accessibility; on Windows and Linux an `AppMenuBar` at the start of the title bar. The title bar's close button saves first, as the OS close does.
 

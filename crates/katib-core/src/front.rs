@@ -89,6 +89,32 @@ fn split_flow(inner: &str) -> Vec<&str> {
     out
 }
 
+/// Every scalar value in `block`, at any depth: `key: value`, `- value` and
+/// flow list items, unquoted. Keys are not values.
+pub(crate) fn scalars(block: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in block.lines().filter(|l| !is_delimiter(l)) {
+        let line = line.trim();
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        let value = match line.split_once(':') {
+            Some((key, value)) if !key.contains(['"', '\'', '[']) => value,
+            _ => line,
+        }
+        .trim();
+        let items = match value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            Some(inner) => split_flow(inner),
+            None => vec![value],
+        };
+        out.extend(
+            items
+                .into_iter()
+                .filter_map(|v| unquote(v.trim()))
+                .filter(|v| !v.is_empty()),
+        );
+    }
+    out
+}
+
 /// A scalar's text: quotes removed, and escapes resolved in double quotes.
 fn unquote(value: &str) -> Option<String> {
     if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
@@ -251,5 +277,12 @@ mod tests {
         let tags = ["x y".to_owned(), "b, c".to_owned(), "q\"t".to_owned()];
         let back = read(&format!("tags: {}\n", list(&tags)));
         assert_eq!(back.tags, tags);
+    }
+
+    #[test]
+    fn scalars_are_every_value_at_any_depth() {
+        let block = "---\nbibliography: refs.bib\nformat:\n  html:\n    css: [a.css, \"b c.css\"]\n\
+                     resources:\n  - 'data.csv'\n---\n";
+        assert_eq!(scalars(block), ["refs.bib", "a.css", "b c.css", "data.csv"]);
     }
 }

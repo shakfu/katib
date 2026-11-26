@@ -139,7 +139,7 @@ impl Vault {
         let dir = self.root.join(".katib");
         let ignore = dir.join(".gitignore");
         let current = fs::read_to_string(&ignore).unwrap_or_default();
-        let missing: String = ["cache/", "drafts/", "trash/"]
+        let missing: String = ["cache/", "drafts/", "out/", "trash/"]
             .iter()
             .filter(|line| !current.lines().any(|l| l.trim() == **line))
             .map(|line| format!("{line}\n"))

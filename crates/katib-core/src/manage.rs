@@ -507,6 +507,26 @@ fn wiki_replacement(
     Ok(Some(wiki_reference(text, link, new)))
 }
 
+/// The bytes of markdown link `s` between its label's `[` and its `]`: skip
+/// `!`, then match brackets, honouring escapes.
+pub(crate) fn label_span(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let open = s.find('[')?;
+    let mut i = open + 1;
+    let mut depth = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => depth += 1,
+            b']' if depth == 1 => return Some((open + 1, i)),
+            b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The byte range of a markdown link's destination path (before any `#`) and
 /// its replacement. `None` for reference-style links, whose destination is on
 /// another line.
@@ -517,18 +537,7 @@ fn destination_replacement(
 ) -> Option<(std::ops::Range<usize>, String)> {
     let s = &text[link.range.clone()];
     let bytes = s.as_bytes();
-    // The label's closing bracket: skip `!`, then match brackets, honouring escapes.
-    let mut i = s.find('[')? + 1;
-    let mut depth = 1;
-    while i < bytes.len() && depth > 0 {
-        match bytes[i] {
-            b'\\' => i += 1,
-            b'[' => depth += 1,
-            b']' => depth -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
+    let mut i = label_span(s)?.1 + 1;
     if bytes.get(i) != Some(&b'(') {
         return None;
     }
