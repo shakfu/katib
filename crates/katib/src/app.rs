@@ -26,7 +26,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 use katib_core::{
-    Backlink, Index, Link, NoteRow, Target, Vault, config::Config, paths::page_folder,
+    Backlink, Index, Link, NoteRow, Target, Vault, config::Config, github, paths::page_folder,
 };
 use notify::Watcher as _;
 
@@ -54,6 +54,7 @@ actions!(
         Save,
         Quit,
         NewNote,
+        NewFolder,
         NewTab,
         CloseTab,
         NextTab,
@@ -69,6 +70,8 @@ actions!(
         PruneAttachments,
         ExportNote,
         RunAndExportNote,
+        ExportForGithub,
+        ExportGithubWiki,
         GoBack,
         GoForward,
         BrokenLinks,
@@ -132,6 +135,7 @@ pub fn set_menus(cx: &mut App) {
     // macOS puts Settings and Quit in the app menu; elsewhere they end File.
     let mut file = vec![
         MenuItem::action("New Note...", NewNote),
+        MenuItem::action("New Folder...", NewFolder),
         MenuItem::action("New Tab", NewTab),
         MenuItem::action("Today's Note", OpenToday),
         MenuItem::action("Open...", OpenPalette),
@@ -160,6 +164,9 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Tags...", BrowseTags),
             MenuItem::action("Broken Links...", BrokenLinks),
             MenuItem::action("Remove Unused Attachments...", PruneAttachments),
+            MenuItem::separator(),
+            MenuItem::action("Export Vault for GitHub...", ExportForGithub),
+            MenuItem::action("Export Vault as GitHub Wiki...", ExportGithubWiki),
         ]),
         Menu::new("View").items([
             MenuItem::action("Overview", ShowOverview),
@@ -198,6 +205,7 @@ pub fn set_menus(cx: &mut App) {
 fn commands(note_open: bool) -> Vec<(&'static str, IconName, Box<dyn Action>)> {
     let mut out: Vec<(&'static str, IconName, Box<dyn Action>)> = vec![
         ("New note...", IconName::Plus, Box::new(NewNote)),
+        ("New folder...", IconName::Folder, Box::new(NewFolder)),
         ("Today's note", IconName::Calendar, Box::new(OpenToday)),
         ("Settings...", IconName::Settings, Box::new(OpenSettings)),
         ("Sync now", IconName::RefreshCw, Box::new(SyncNow)),
@@ -223,6 +231,16 @@ fn commands(note_open: bool) -> Vec<(&'static str, IconName, Box<dyn Action>)> {
             "Remove unused attachments...",
             IconName::Delete,
             Box::new(PruneAttachments),
+        ),
+        (
+            "Export vault for GitHub...",
+            IconName::ExternalLink,
+            Box::new(ExportForGithub),
+        ),
+        (
+            "Export vault as GitHub wiki...",
+            IconName::ExternalLink,
+            Box::new(ExportGithubWiki),
         ),
     ];
     if note_open {
@@ -337,6 +355,8 @@ pub struct Katib {
     broken: Vec<links::BrokenRow>,
     /// Why the last settings change was refused, shown in the settings dialog.
     settings_error: Option<String>,
+    /// The agent fields' state in Settings; made when Settings first opens.
+    agent_fields: Option<settings::AgentFields>,
     /// Holds focus when no editor does, so the window's key bindings apply.
     focus: FocusHandle,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -430,6 +450,7 @@ impl Katib {
             exporting: None,
             note_tags: Vec::new(),
             settings_error: None,
+            agent_fields: None,
             focus: cx.focus_handle(),
             _watcher: watcher,
             _subscriptions: subscriptions.into_iter().chain([activation]).collect(),
@@ -538,7 +559,7 @@ impl Katib {
     fn close(&mut self, cx: &mut Context<Self>) {
         self.save_all(cx);
         if self.all_saved(cx) {
-            self.sync.commit_now();
+            self.sync.commit_now(&self.vault);
         }
     }
 
@@ -878,6 +899,9 @@ impl Katib {
             .on_action(cx.listener(|this, _: &NewNote, w, cx| {
                 this.prompt_name(manage::Naming::Create, w, cx)
             }))
+            .on_action(cx.listener(|this, _: &NewFolder, w, cx| {
+                this.prompt_name(manage::Naming::CreateFolder, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &CloseTab, w, cx| this.close_tab(this.active, w, cx)))
             .on_action(cx.listener(|this, _: &NextTab, w, cx| this.cycle_tab(1, w, cx)))
             .on_action(cx.listener(|this, _: &PrevTab, w, cx| this.cycle_tab(-1, w, cx)))
@@ -909,6 +933,12 @@ impl Katib {
             .on_action(
                 cx.listener(|this, _: &RunAndExportNote, w, cx| this.prompt_export(true, w, cx)),
             )
+            .on_action(cx.listener(|this, _: &ExportForGithub, w, cx| {
+                this.export_github(github::Style::Repository, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportGithubWiki, w, cx| {
+                this.export_github(github::Style::Wiki, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoBack, w, cx| this.go(true, w, cx)))
             .on_action(cx.listener(|this, _: &GoForward, w, cx| this.go(false, w, cx)))
             .on_action(cx.listener(|this, _: &BrokenLinks, w, cx| this.open_broken(w, cx)))

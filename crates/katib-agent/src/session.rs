@@ -35,15 +35,35 @@ pub enum Event {
     /// The session could not start; it takes no prompts.
     Failed(String),
     Text(String),
+    /// A tool call began. `id` matches its `ToolEnd`; calls may overlap. `note` is the note it
+    /// acts on, if any, and `detail` its other argument.
     ToolStart {
+        id: String,
         name: String,
-        arguments: String,
+        note: Option<String>,
+        detail: Option<String>,
     },
     /// `ok` is false when the call failed; `body` is what the model was told.
     ToolEnd {
+        id: String,
         body: String,
         note: Option<String>,
         ok: bool,
+    },
+    /// An outside agent asks before a tool call. Answer with `Session::answer(ask, ..)`.
+    Permission {
+        ask: u64,
+        title: String,
+        note: Option<String>,
+        options: Vec<PermissionOption>,
+    },
+    /// Permission request `ask` was answered, or cancelled with its prompt.
+    Answered(u64),
+    /// An outside agent's totals: tokens in its window, the window, and the session's cost.
+    Totals {
+        used: u32,
+        size: u32,
+        cost: Option<f64>,
     },
     Retry {
         attempt: u32,
@@ -56,6 +76,15 @@ pub enum Event {
         after: u32,
     },
     Done(Finish),
+}
+
+/// One answer an outside agent offers to a permission request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOption {
+    pub id: String,
+    pub name: String,
+    /// It allows the call, once or from now on.
+    pub allow: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +108,8 @@ pub struct Choice {
 
 pub struct Session {
     prompts: async_channel::Sender<(String, Cancel)>,
+    /// Answers to permission requests; only an outside agent asks.
+    answers: async_channel::Sender<(u64, Option<String>)>,
     events: async_channel::Receiver<Event>,
     /// Set on drop: ends the running prompt and drops the queued ones.
     stop: Cancel,
@@ -91,16 +122,7 @@ impl Session {
         Self::spawn(move || async move {
             let dir = machine::config_dir();
             let memory = Memory::load(dir.as_deref());
-            let request = Request {
-                provider: choice.provider,
-                model: choice.model,
-                base_url: choice.base_url,
-                max_turns: MAX_TURNS,
-                cache_dir: dir.clone(),
-                last_provider: memory.provider().map(String::from),
-                ..Request::default()
-            };
-            let mut config = request
+            let mut config = request(&choice, &memory, dir.clone())
                 .resolve(|var| machine::key(dir.as_deref(), var), |p| memory.model(p))
                 .await
                 .map_err(|e| e.to_string())?;
@@ -132,28 +154,44 @@ impl Session {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<Agent, String>>,
     {
+        Self::spawn_with(move |inbox, _answers, sender, stopped| {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    let _ = sender.try_send(Event::Failed(format!("starting the agent: {e}")));
+                    return;
+                }
+            };
+            runtime.block_on(serve(make(), inbox, sender, stopped));
+        })
+    }
+
+    /// Runs `body` on the agent thread with the session's channels: prompts in, answers in,
+    /// events out, and the token set on drop.
+    pub(crate) fn spawn_with(
+        body: impl FnOnce(
+            async_channel::Receiver<(String, Cancel)>,
+            async_channel::Receiver<(u64, Option<String>)>,
+            async_channel::Sender<Event>,
+            Cancel,
+        ) + Send
+        + 'static,
+    ) -> Self {
         let (prompts, inbox) = async_channel::unbounded::<(String, Cancel)>();
+        let (answers, answered) = async_channel::unbounded();
         let (sender, events) = async_channel::unbounded();
         let stop = Cancel::new();
         let stopped = stop.clone();
         std::thread::Builder::new()
             .name("katib-agent".into())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(e) => {
-                        let _ = sender.try_send(Event::Failed(format!("starting the agent: {e}")));
-                        return;
-                    }
-                };
-                runtime.block_on(serve(make(), inbox, sender, stopped));
-            })
+            .spawn(move || body(inbox, answered, sender, stopped))
             .expect("spawning the agent thread");
         Self {
             prompts,
+            answers,
             events,
             stop,
         }
@@ -166,6 +204,11 @@ impl Session {
         // `Event::Failed` already reported.
         let _ = self.prompts.try_send((text.into(), cancel.clone()));
         cancel
+    }
+
+    /// Answers permission request `ask` with an option's id, or `None` to refuse it.
+    pub fn answer(&self, ask: u64, option: Option<String>) {
+        let _ = self.answers.try_send((ask, option));
     }
 
     /// Every event, in order. The stream ends once the session stops.
@@ -222,6 +265,7 @@ async fn serve(
         let mut forward = Forward {
             events: &events,
             refused: false,
+            calls: 0,
         };
         // The session is ending, so a run dropped mid-way leaves nothing that matters.
         let result = tokio::select! {
@@ -229,13 +273,22 @@ async fn serve(
             () = stop.cancelled() => return,
             result = agent.run(&prompt, &mut forward, &cancel) => result,
         };
-        let finish = match result {
-            Err(e) => Finish::Failed(format!("{e:#}")),
-            Ok(()) if cancel.is_cancelled() => Finish::Cancelled,
-            Ok(()) if forward.refused => Finish::Refused,
-            Ok(()) => Finish::Answered,
-        };
+        let finish = finish(&mut agent, result, &cancel, forward.refused);
         let _ = events.try_send(Event::Done(finish));
+    }
+}
+
+/// How a run ended. A refused prompt is dropped from the conversation, so the next request does
+/// not carry it to the model again.
+fn finish(agent: &mut Agent, result: anyhow::Result<()>, cancel: &Cancel, refused: bool) -> Finish {
+    match result {
+        Err(e) => Finish::Failed(format!("{e:#}")),
+        Ok(()) if cancel.is_cancelled() => Finish::Cancelled,
+        Ok(()) if refused => {
+            agent.forget_last_prompt();
+            Finish::Refused
+        }
+        Ok(()) => Finish::Answered,
     }
 }
 
@@ -243,6 +296,8 @@ async fn serve(
 struct Forward<'a> {
     events: &'a async_channel::Sender<Event>,
     refused: bool,
+    /// Calls started; the loop runs one at a time, so the last is the open one.
+    calls: u32,
 }
 
 impl Forward<'_> {
@@ -257,14 +312,19 @@ impl Frontend for Forward<'_> {
     }
 
     fn tool_start(&mut self, name: &str, arguments: &str) {
+        self.calls += 1;
+        let target = crate::describe(name, arguments);
         self.send(Event::ToolStart {
+            id: self.calls.to_string(),
             name: name.to_owned(),
-            arguments: arguments.to_owned(),
+            note: target.note,
+            detail: target.detail,
         });
     }
 
     fn tool_end(&mut self, body: &str, note: Option<&str>, ok: bool) {
         self.send(Event::ToolEnd {
+            id: self.calls.to_string(),
             body: body.to_owned(),
             note: note.map(String::from),
             ok,
@@ -287,6 +347,28 @@ impl Frontend for Forward<'_> {
 
     fn refused(&mut self) {
         self.refused = true;
+    }
+}
+
+/// The request for `choice`, filled from `memory`. A provider chosen in Settings is named, not
+/// only preferred: autoselect skips providers without a key, so it would never pick a local
+/// server, and with a key set would pick another provider unseen.
+fn request(choice: &Choice, memory: &Memory, dir: Option<std::path::PathBuf>) -> Request {
+    let provider = choice
+        .provider
+        .clone()
+        .or_else(|| memory.provider().map(String::from));
+    let base_url = choice.base_url.clone().or_else(|| {
+        let url = memory.base_url(provider.as_deref()?)?;
+        Some(url.to_owned())
+    });
+    Request {
+        provider,
+        model: choice.model.clone(),
+        base_url,
+        max_turns: MAX_TURNS,
+        cache_dir: dir,
+        ..Request::default()
     }
 }
 
@@ -373,8 +455,10 @@ mod tests {
         let got = until_done(&events);
         assert!(
             got.contains(&Event::ToolStart {
+                id: "1".into(),
                 name: "write".into(),
-                arguments: args.clone()
+                note: Some("hello".into()),
+                detail: None,
             }),
             "{got:?}"
         );
@@ -428,6 +512,67 @@ mod tests {
         while let Some(event) = next(&events) {
             assert_ne!(event, Event::Text("late".into()));
         }
+    }
+
+    #[test]
+    fn the_chosen_provider_and_its_base_url_are_named() {
+        let dir = Scratch::new("katib-session-request");
+        let root = PathBuf::from(dir.file(""));
+        let mut memory = Memory::load(Some(&root));
+        memory.set_provider(Some(&root), Some("ollama"));
+        memory
+            .set_base_url(Some(&root), "ollama", "http://box:11434/v1")
+            .unwrap();
+        let named = request(&Choice::default(), &memory, None);
+        assert_eq!(named.provider.as_deref(), Some("ollama"));
+        assert_eq!(named.base_url.as_deref(), Some("http://box:11434/v1"));
+
+        // A local server resolves with no key set anywhere.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let named = Request {
+            model: Some("m".into()),
+            ..named
+        };
+        let config = rt.block_on(named.resolve(|_| None, |_| None)).unwrap();
+        assert_eq!(
+            (config.provider.as_str(), config.base_url.as_str()),
+            ("ollama", "http://box:11434/v1")
+        );
+
+        // Automatic: nothing named.
+        memory.set_provider(Some(&root), None);
+        let auto = request(&Choice::default(), &memory, None);
+        assert_eq!((auto.provider, auto.base_url), (None, None));
+    }
+
+    #[test]
+    fn a_refused_prompt_is_dropped_from_the_conversation() {
+        let dir = Scratch::new("katib-session-refused");
+        let script = json!({ "ok": [[{ "text": "fine" }]], "bad": [["refused"]] });
+        let mock = Mock::from_script(&script.to_string()).unwrap();
+        let tools = VaultTools::open(Vault::open(dir.file("")).unwrap()).unwrap();
+        let mut agent = Agent::new(Provider::Mock(mock), config(), "s".into(), Box::new(tools));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let run = |agent: &mut Agent, prompt: &str| {
+            let mut forward = Forward {
+                events: &async_channel::unbounded().0,
+                refused: false,
+                calls: 0,
+            };
+            let cancel = Cancel::new();
+            let result = rt.block_on(agent.run(prompt, &mut forward, &cancel));
+            finish(agent, result, &cancel, forward.refused)
+        };
+        assert_eq!(run(&mut agent, "ok"), Finish::Answered);
+        let kept = agent.messages().len();
+        assert_eq!(run(&mut agent, "bad"), Finish::Refused);
+        assert_eq!(agent.messages().len(), kept);
     }
 
     #[test]

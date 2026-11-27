@@ -98,13 +98,16 @@ impl SyncState {
         }
     }
 
-    /// Commit what is saved, without the network; for closing the window.
-    pub(super) fn commit_now(&self) {
+    /// Commit what is saved, without the network; for closing the window. Waits for an
+    /// agent's move to finish.
+    pub(super) fn commit_now(&self, vault: &Vault) {
         if let Some(repo) = &self.repo
             && self.schedule.changed()
-            && let Err(e) = repo.commit_all(&self.host)
         {
-            eprintln!("katib: {e}");
+            let _exclusive = vault.exclusive();
+            if let Err(e) = repo.commit_all(&self.host) {
+                eprintln!("katib: {e}");
+            }
         }
     }
 
@@ -159,12 +162,17 @@ impl Katib {
             return;
         };
         let host = self.sync.host.clone();
+        let vault = self.vault.clone();
         self.sync.busy = true;
         self.sync.schedule.started();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { repo.sync(true, &host) })
+                .background_spawn(async move {
+                    // An agent's move lands whole in this cycle or the next.
+                    let _exclusive = vault.exclusive();
+                    repo.sync(true, &host)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| this.sync_done(result, cx));
         })
@@ -390,12 +398,14 @@ impl Katib {
             .map(|(p, c)| (p.clone(), c.clone()))
             .collect();
         let host = self.sync.host.clone();
+        let vault = self.vault.clone();
         window.close_dialog(cx);
         self.sync.busy = true;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
+                    let _exclusive = vault.exclusive();
                     // Commit saved edits first; the merge is computed against HEAD.
                     repo.commit_all(&host)?;
                     repo.resolve(&c.theirs, &choices, &host)

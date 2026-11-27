@@ -14,7 +14,11 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::*;
-use katib_core::export::{self, ExportError, Format};
+use katib_core::{
+    Index,
+    export::{self, ExportError, Format},
+    github,
+};
 
 use super::{Katib, notify_error};
 
@@ -108,6 +112,64 @@ impl Katib {
                     Err(ExportError::Cancelled) => {}
                     Err(e) => notify_error(window, cx, e.to_string()),
                 }
+            });
+        })
+        .detach();
+    }
+
+    /// Ask for a folder, then write the vault there as GitHub renders it
+    /// (`katib_core::github`). The folder rules are checked before writing.
+    pub(super) fn export_github(
+        &mut self,
+        style: github::Style,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_open(cx);
+        if let Err(e) = self.index.borrow_mut().sync(&self.vault) {
+            return notify_error(window, cx, e.to_string());
+        }
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Export".into()),
+        });
+        let vault = self.vault.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = picked.await else {
+                return;
+            };
+            let Some(dest) = paths.pop() else {
+                return;
+            };
+            let shown = dest.display().to_string();
+            // The window's index is not Send; this one reads the same file.
+            let result = cx
+                .background_spawn(async move {
+                    let index = Index::open(&vault)?;
+                    github::export(&vault, &index, &dest, style)
+                })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(report) => {
+                    let mut message = format!(
+                        "Exported {} notes and {} files to {shown}",
+                        report.notes, report.files
+                    );
+                    if report.unlinked.is_empty() {
+                        return window.push_notification(Notification::info(message), cx);
+                    }
+                    message += &format!(
+                        ". {} links match no single note and are left as text:",
+                        report.unlinked.len()
+                    );
+                    for u in report.unlinked.iter().take(5) {
+                        message += &format!("\n{}: {}", u.id, u.link);
+                    }
+                    window.push_notification(Notification::warning(message), cx);
+                }
+                Err(e) => notify_error(window, cx, e.to_string()),
             });
         })
         .detach();

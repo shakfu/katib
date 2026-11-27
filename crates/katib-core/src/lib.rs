@@ -5,6 +5,7 @@ pub mod complete;
 pub mod config;
 pub mod export;
 pub mod front;
+pub mod github;
 mod index;
 mod manage;
 pub mod md;
@@ -21,9 +22,9 @@ pub use index::{
     TagCount, Target, TaskRow,
 };
 pub use manage::{
-    ManageError, Moved, move_folder, move_note, preview_move_folder, preview_move_note, retarget,
-    trash_note, untitled_id,
+    ManageError, Moved, move_folder, move_note, move_note_edits, preview_move_folder,
+    preview_move_note, retarget, trash_note, untitled_id,
 };
 pub use note::{Item, Link, LinkKind, Note, heading_offset, parse, text_links};
-pub use vault::{Entry, Vault, VaultError};
+pub use vault::{Entry, Exclusive, Vault, VaultError};
 pub use write::{SaveError, autosave_due, save_guarded, write_atomic};

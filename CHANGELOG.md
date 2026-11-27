@@ -1,13 +1,12 @@
 # Changelog
 
-All notable changes to katib. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Design detail is in
-[docs/dev/design.md](docs/dev/design.md).
+All notable changes to katib. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Design detail is in [docs/dev/design.md](docs/dev/design.md).
 
 ## 0.2.0
 
 ### Added
 
-- **Note management.** Create, rename, move and delete notes, and rename or move folders, from the tree's context menu or the palette. A move rewrites every link to the moved notes, including reference-style definitions, and rebases the moved notes' own relative links. Delete moves the note to `.katib/trash/`.
+- **Note management.** Create, rename, move and delete notes, and rename or move folders, from the tree's context menu or the palette. A move rewrites every link to the moved notes, including reference-style definitions, and rebases the moved notes' own relative links. Delete moves the note to `.katib/trash/`. "New folder..." creates a folder with its page, `README.md`, since git keeps no empty folder and the tree lists notes.
 
 - **Attachments.** Paste or drop images and files, or use "Attach file...". Files are stored under `attachments/<hash>/` named by SHA-256, so the same bytes are stored once; files over 50 MB are refused. "Remove unused attachments..." moves unlinked files to the trash. Remote images are not fetched, so reading a note tells no server.
 
@@ -18,6 +17,12 @@ All notable changes to katib. The format follows [Keep a Changelog](https://keep
 - **Tables and front matter in live mode.** GFM tables draw as grids, with links and emphasis in cells. Front matter is hidden until the caret enters it; Up from the first line reaches it. In a table, write a wiki link label as `[[Page\|label]]`, since a bare `|` splits the cell; links read and moves keep that form.
 
 - **Export with Quarto.** "Export note..." renders the open note to HTML, PDF, Word, EPUB or GitHub markdown in `.katib/out/`, and opens it. Code cells are shown, not run, so neither R nor Python is needed. "Run and export note..." runs them first, in the note's folder. Running is a separate command, not a default, because synced notes can carry other people's code. Links to other notes become their label, since a single file has nowhere for them to go. The note's front matter reaches Quarto, so options such as `format: typst: toc: true` and `bibliography:` apply. Files the front matter names are copied along with it. In front matter, `${VAULT}` is the vault root and `${HOME}` your home folder, as in `reference-doc: ${VAULT}/templates/house.docx`; templates in the vault sync with it. Other names are refused rather than read from the environment, since a synced note could otherwise copy a secret into a document you share. Vault-wide defaults go in `.katib/quarto.yml`, which is committed with the vault; a note's front matter overrides them. Needs [Quarto](https://quarto.org) on PATH.
+
+- **Export for GitHub.** `katib export <vault> <dest>`, or "Export vault for GitHub...", writes a copy of the vault with wiki links as relative markdown links, which GitHub's file view renders. `--wiki`, or "Export vault as GitHub wiki...", writes it for a GitHub wiki instead: notes at the top level under unique page names, since wiki page URLs ignore folders. A vault with no root README gets a generated `Home` page that lists every note. Front matter, which a wiki shows as text, is dropped; its `title` becomes the heading. Links that match no single note are left as text and listed. The destination must be empty, or a git work tree with nothing uncommitted, whose files are replaced; so a wiki clone can be exported into, then committed. Rules: [docs/dev/github-export.md](docs/dev/github-export.md).
+
+- **MCP server.** `katib mcp <vault>` serves the vault over the Model Context Protocol's stdio transport, for agents outside katib: list, read, search, backlinks, write, edit, move and delete. Replacing or deleting a note requires reading it first and fails if it changed since, so an agent never overwrites an edit it has not seen. Moves exclude a sync cycle across processes through a lock file in `.katib/cache/`, so a commit never holds half a move. The server does not commit; the window's sync does.
+
+- **LSP server.** `katib lsp [vault]` gives other editors wiki link completion, go to definition, broken links as diagnostics, and rename as a move that rewrites every link to the note. Rename sends the edits and the file rename for the editor to apply, rather than writing files under its open buffers. It is refused while a note it would rewrite has unsaved changes, since its edits are computed from the files.
 
 - **Move preview.** The rename dialog lists the notes a move will rewrite, or why it would be refused, as you type.
 

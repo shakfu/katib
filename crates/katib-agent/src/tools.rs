@@ -14,7 +14,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::LocalBoxFuture;
-use katib_core::{Entry, Index, SaveError, Vault, move_note, save_guarded};
+use katib_core::{Entry, Index, SaveError, Vault, move_note, save_guarded, trash_note};
 use minima_core::Cancel;
 use minima_core::tools::{Outcome, Spec, Tools, parse, schema_of};
 use schemars::JsonSchema;
@@ -229,6 +229,43 @@ impl VaultTools {
         Ok(())
     }
 
+    /// Moves a note to the trash, if it still holds what this agent read: a delete is never of
+    /// an edit the agent has not seen. Links to it are left, and named, for the agent to fix.
+    fn delete(&self, args: NoteArgs) -> Result<String> {
+        let entry = self.entry(&args.note)?;
+        let disk = match fs::read_to_string(&entry.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => bail!("no note {}", entry.id),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", entry.id)),
+        };
+        match self.seen.borrow().get(&entry.id) {
+            None => bail!("read {} before deleting it", entry.id),
+            Some(seen) if *seen != disk => {
+                bail!("{} changed since you read it; read it again", entry.id)
+            }
+            Some(_) => {}
+        }
+        let mut linking: Vec<String> = self
+            .synced()?
+            .backlinks(&entry.id)?
+            .into_iter()
+            .map(|b| b.src)
+            .filter(|src| *src != entry.id)
+            .collect();
+        linking.dedup();
+        trash_note(&self.vault, &entry.id)?;
+        self.seen.borrow_mut().remove(&entry.id);
+        self.synced()?;
+        Ok(match linking.is_empty() {
+            true => format!("moved {} to the trash", entry.id),
+            false => format!(
+                "moved {} to the trash; links to it remain in {}",
+                entry.id,
+                linking.join(", ")
+            ),
+        })
+    }
+
     fn move_note(&self, args: MoveArgs) -> Result<String> {
         let (from, to) = (self.entry(&args.from)?, self.entry(&args.to)?);
         let moved = {
@@ -327,6 +364,11 @@ impl Tools for VaultTools {
                 "move",
                 "Move or rename a note, rewriting every link to it across the vault.",
             ),
+            spec::<NoteArgs>(
+                "delete",
+                "Move a note you have read to the vault's trash. Fails if it changed since you \
+                 read it. Names the notes still linking to it.",
+            ),
         ]
     }
 
@@ -344,6 +386,7 @@ impl Tools for VaultTools {
             "write" => parse(arguments).and_then(|a| self.write(a)),
             "edit" => parse(arguments).and_then(|a| self.edit(a)),
             "move" => parse(arguments).and_then(|a| self.move_note(a)),
+            "delete" => parse(arguments).and_then(|a| self.delete(a)),
             _ => Err(anyhow::anyhow!("no such tool: {name}")),
         };
         Box::pin(std::future::ready(body.map(Outcome::from)))

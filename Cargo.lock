@@ -3831,6 +3831,7 @@ dependencies = [
  "katib-agent",
  "katib-core",
  "katib-editor",
+ "katib-lsp",
  "katib-sync",
  "lsp-types",
  "notify",
@@ -3868,6 +3869,15 @@ dependencies = [
  "gpui-kit",
  "katib-core",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "katib-lsp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "katib-core",
+ "serde_json",
 ]
 
 [[package]]

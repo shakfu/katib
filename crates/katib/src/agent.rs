@@ -5,14 +5,15 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{InputEvent, Textarea, TextareaState},
+    input::{Escape, InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
     text::{TextView, TextViewState},
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
+use katib_agent::acp::{self, McpServer};
 use katib_agent::machine::{self, Memory};
-use katib_agent::{Cancel, Choice, Event, Finish, Session, describe};
+use katib_agent::{Cancel, Choice, Event, Finish, PermissionOption, Session};
 use katib_core::Vault;
 
 /// One entry of the transcript.
@@ -21,6 +22,7 @@ enum Row {
     /// Streamed markdown, appended to as it arrives.
     Assistant(Entity<TextViewState>),
     Tool {
+        id: String,
         name: String,
         note: Option<String>,
         detail: Option<String>,
@@ -30,6 +32,14 @@ enum Row {
     Notice {
         text: String,
         error: bool,
+    },
+    /// An outside agent asks before a tool call; `answered` is the choice once made.
+    Permission {
+        ask: u64,
+        title: String,
+        note: Option<String>,
+        options: Vec<PermissionOption>,
+        answered: Option<String>,
     },
 }
 
@@ -57,6 +67,11 @@ pub struct AgentPanel {
     memory: Memory,
     /// The prompt running, while one is.
     running: Option<Cancel>,
+    /// Prompts typed while one runs, sent in order once it answers. Shown below the transcript
+    /// rather than in it, so they do not interleave with the answer still streaming.
+    queued: Vec<String>,
+    /// For putting queued prompts back in the input from an event.
+    window: AnyWindowHandle,
     rows: Vec<Row>,
     scroller: Entity<MessageScrollerState>,
     input: Entity<TextareaState>,
@@ -92,6 +107,8 @@ impl AgentPanel {
             status: Status::Idle,
             memory: Memory::load(machine::config_dir().as_deref()),
             running: None,
+            queued: Vec::new(),
+            window: window.window_handle(),
             rows: Vec::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             input,
@@ -136,10 +153,29 @@ impl AgentPanel {
         let Some(provider) = self.memory.provider().map(String::from) else {
             return;
         };
+        // A new conversation for the same model would only lose the current one.
+        if self.memory.model(&provider).unwrap_or_default() == model.trim() {
+            return;
+        }
         let dir = machine::config_dir();
         self.memory
             .set_model(dir.as_deref(), &provider, Some(model));
         self.restart(cx);
+    }
+
+    /// Use `url` as the chosen provider's base URL; blank is the registry's. A URL that is not
+    /// one is refused, with the reason.
+    pub fn choose_base_url(&mut self, url: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let Some(provider) = self.memory.provider().map(String::from) else {
+            return Ok(());
+        };
+        if self.memory.base_url(&provider).unwrap_or_default() == url.trim().trim_end_matches('/') {
+            return Ok(());
+        }
+        let dir = machine::config_dir();
+        self.memory.set_base_url(dir.as_deref(), &provider, url)?;
+        self.restart(cx);
+        Ok(())
     }
 
     /// A new conversation, with the provider and model now chosen. Only if one was started.
@@ -153,16 +189,31 @@ impl AgentPanel {
         // Dropping the old session cancels its prompt and stops its thread.
         self.session = None;
         self.running = None;
+        self.queued.clear();
         self.rows.clear();
         self.cost = None;
         self.used = 0;
         self.scroller.update(cx, |s, cx| s.reset(0, cx));
         self.status = Status::Starting;
-        let choice = Choice {
-            extra: Some(self.extra.clone()),
-            ..Choice::default()
+        let session = match self.memory.outside().map(String::from) {
+            Some(id) => match acp::split_command(&self.memory.command(&id)) {
+                Ok(command) => Session::acp(self.vault.clone(), command, self.mcp()),
+                Err(e) => {
+                    self.status = Status::Failed;
+                    self.notice(format!("The agent's command: {e}"), true, cx);
+                    self.notice(OUTSIDE_HINT, false, cx);
+                    cx.notify();
+                    return;
+                }
+            },
+            None => {
+                let choice = Choice {
+                    extra: Some(self.extra.clone()),
+                    ..Choice::default()
+                };
+                Session::start(self.vault.clone(), choice)
+            }
         };
-        let session = Session::start(self.vault.clone(), choice);
         let events = session.events();
         self._events = Some(cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
@@ -178,17 +229,102 @@ impl AgentPanel {
         cx.notify();
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).value().trim().to_owned();
-        if text.is_empty() || self.running.is_some() || !matches!(self.status, Status::Ready { .. })
-        {
+    /// `katib mcp <vault>`, offered to an outside agent so it gets the note tools. None if this
+    /// program's path is unknown.
+    fn mcp(&self) -> Option<McpServer> {
+        let command = std::env::current_exe().ok()?;
+        let root = std::path::absolute(self.vault.root()).ok()?;
+        Some(McpServer {
+            name: "katib".into(),
+            command,
+            args: vec!["mcp".into(), root.display().to_string()],
+        })
+    }
+
+    /// Use outside agent `id` (a preset's, or `custom`) from now on; `None` is the built-in one.
+    pub fn choose_outside(&mut self, id: Option<&str>, cx: &mut Context<Self>) {
+        if self.memory.outside() == id {
             return;
         }
+        let dir = machine::config_dir();
+        self.memory.set_outside(dir.as_deref(), id);
+        self.restart(cx);
+    }
+
+    /// The command line for outside agent `id`; blank is its preset's. Refused, with the reason,
+    /// if it does not split into words.
+    pub fn choose_command(
+        &mut self,
+        id: &str,
+        line: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.memory.command(id) == line.trim() {
+            return Ok(());
+        }
+        let dir = machine::config_dir();
+        self.memory.set_command(dir.as_deref(), id, line)?;
+        if self.memory.outside() == Some(id) {
+            self.restart(cx);
+        }
+        Ok(())
+    }
+
+    /// Answers permission request `ask` with option `option`.
+    fn permit(&mut self, ask: u64, option: &PermissionOption, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        session.answer(ask, Some(option.id.clone()));
+        for row in &mut self.rows {
+            if let Row::Permission {
+                ask: a, answered, ..
+            } = row
+                && *a == ask
+            {
+                *answered = Some(option.name.clone());
+            }
+        }
+        cx.notify();
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).value().trim().to_owned();
+        if text.is_empty() || !matches!(self.status, Status::Ready { .. }) {
+            return;
+        }
+        if self.running.is_some() {
+            self.queued.push(text);
+        } else {
+            self.send(text, cx);
+        }
+        self.input.update(cx, |s, cx| s.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn send(&mut self, text: String, cx: &mut Context<Self>) {
         let Some(session) = &self.session else { return };
         self.running = Some(session.prompt(text.clone()));
         self.push(Row::User(text), cx);
-        self.input.update(cx, |s, cx| s.set_value("", window, cx));
-        cx.notify();
+    }
+
+    /// Queued prompts back into the input, ahead of what it holds, for a prompt that stopped:
+    /// they may have depended on its answer.
+    fn unqueue(&mut self, cx: &mut Context<Self>) {
+        if self.queued.is_empty() {
+            return;
+        }
+        let mut parts = std::mem::take(&mut self.queued);
+        let input = self.input.clone();
+        let current = input.read(cx).value().trim().to_owned();
+        if !current.is_empty() {
+            parts.push(current);
+        }
+        let text = parts.join("\n\n");
+        let handle = self.window;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                input.update(cx, |s, cx| s.set_value(text, window, cx));
+            });
+        });
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -232,8 +368,12 @@ impl AgentPanel {
             }
             Event::Failed(e) => {
                 self.status = Status::Failed;
+                self.running = None;
                 self.notice(e, true, cx);
-                self.notice(key_hint(), false, cx);
+                match self.memory.outside() {
+                    Some(_) => self.notice(OUTSIDE_HINT, false, cx),
+                    None => self.notice(key_hint(), false, cx),
+                }
             }
             Event::Text(delta) => match self.rows.last() {
                 Some(Row::Assistant(state)) => {
@@ -245,25 +385,70 @@ impl AgentPanel {
                     self.push(Row::Assistant(state), cx);
                 }
             },
-            Event::ToolStart { name, arguments } => {
-                let target = describe(&name, &arguments);
-                self.push(
-                    Row::Tool {
-                        name,
-                        note: target.note,
-                        detail: target.detail,
-                        result: None,
-                    },
-                    cx,
-                );
-            }
-            Event::ToolEnd { body, note, ok } => {
+            Event::ToolStart {
+                id,
+                name,
+                note,
+                detail,
+            } => self.push(
+                Row::Tool {
+                    id,
+                    name,
+                    note,
+                    detail,
+                    result: None,
+                },
+                cx,
+            ),
+            Event::ToolEnd { id, body, note, ok } => {
                 let summary = note.unwrap_or(body);
                 let line = summary.lines().next().unwrap_or_default().to_owned();
-                if let Some(Row::Tool { result, .. }) = self.rows.last_mut() {
+                // Calls can overlap, so the row is found by id.
+                let at = self
+                    .rows
+                    .iter()
+                    .rposition(|r| matches!(r, Row::Tool { id: i, .. } if *i == id));
+                if let Some(ix) = at
+                    && let Row::Tool { result, .. } = &mut self.rows[ix]
+                {
                     *result = Some((ok, line));
-                    self.remeasure_last(cx);
+                    self.scroller.update(cx, |s, cx| {
+                        s.remeasure_items(ix..ix + 1, cx);
+                    });
                 }
+            }
+            Event::Permission {
+                ask,
+                title,
+                note,
+                options,
+            } => self.push(
+                Row::Permission {
+                    ask,
+                    title,
+                    note,
+                    options,
+                    answered: None,
+                },
+                cx,
+            ),
+            Event::Answered(ask) => {
+                for row in &mut self.rows {
+                    if let Row::Permission {
+                        ask: a, answered, ..
+                    } = row
+                        && *a == ask
+                        && answered.is_none()
+                    {
+                        *answered = Some("Cancelled".into());
+                    }
+                }
+            }
+            Event::Totals { used, size, cost } => {
+                self.used = used;
+                self.context = size;
+                self.cost = cost;
+                self.cost_estimated = false;
             }
             Event::Retry { attempt, delay } => self.notice(
                 format!("Retrying in {} s (attempt {attempt})", delay.as_secs()),
@@ -285,11 +470,23 @@ impl AgentPanel {
             ),
             Event::Done(finish) => {
                 self.running = None;
+                let go_on = matches!(finish, Finish::Answered | Finish::Refused);
                 match finish {
                     Finish::Answered => {}
                     Finish::Cancelled => self.notice("Stopped", false, cx),
-                    Finish::Refused => self.notice("The model declined to answer", true, cx),
+                    Finish::Refused => self.notice(
+                        "The model declined to answer. The prompt is dropped from the \
+                         conversation.",
+                        true,
+                        cx,
+                    ),
                     Finish::Failed(e) => self.notice(e, true, cx),
+                }
+                if !go_on {
+                    self.unqueue(cx);
+                } else if !self.queued.is_empty() {
+                    let next = self.queued.remove(0);
+                    self.send(next, cx);
                 }
             }
         }
@@ -321,6 +518,7 @@ impl AgentPanel {
                 note,
                 detail,
                 result,
+                ..
             } => {
                 let icon = match result {
                     None => IconName::LoaderCircle,
@@ -359,6 +557,63 @@ impl AgentPanel {
                     }))
                     .into_any_element()
             }
+            Row::Permission {
+                ask,
+                title,
+                note,
+                options,
+                answered,
+            } => {
+                let view = view.clone();
+                let target = note.clone().map(|id| {
+                    let view = view.clone();
+                    div()
+                        .id(("permission-note", ix))
+                        .text_color(theme.link)
+                        .cursor_pointer()
+                        .child(id.clone())
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |_, cx| cx.emit(OpenNote(id.clone())))
+                        })
+                });
+                let ask = *ask;
+                let choices = match answered {
+                    Some(choice) => div()
+                        .text_color(theme.muted_foreground)
+                        .child(choice.clone())
+                        .into_any_element(),
+                    None => h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(options.iter().enumerate().map(|(n, option)| {
+                            let (view, option) = (view.clone(), option.clone());
+                            Button::new(("permit", ix * 16 + n))
+                                .xsmall()
+                                .label(option.name.clone())
+                                .when(option.allow, |b| b.primary())
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.permit(ask, &option, cx))
+                                })
+                        }))
+                        .into_any_element(),
+                };
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(IconName::CircleAlert)
+                            .child(format!("Allow {title}?"))
+                            .children(target),
+                    )
+                    .child(choices)
+                    .into_any_element()
+            }
             Row::Notice { text, error } => div()
                 .text_xs()
                 .text_color(if *error {
@@ -377,6 +632,7 @@ impl AgentPanel {
             Status::Idle => return String::new(),
             Status::Starting => return "Starting...".into(),
             Status::Failed => return "Not started".into(),
+            Status::Ready { provider, model } if model.is_empty() => provider.clone(),
             Status::Ready { provider, model } => format!("{provider} / {model}"),
         };
         let mut parts = vec![model];
@@ -391,6 +647,10 @@ impl AgentPanel {
         parts.join("  ")
     }
 }
+
+/// For an outside agent that could not start.
+const OUTSIDE_HINT: &str = "Check the agent's command in Settings, Agent. An agent that needs a \
+    sign-in, such as Claude Code, needs it done once in a terminal.";
 
 /// Where keys are read from, for a session that could not start.
 fn key_hint() -> String {
@@ -416,7 +676,7 @@ impl Render for AgentPanel {
         let send = if running {
             Button::new("agent-stop")
                 .icon(IconName::Square)
-                .tooltip("Stop")
+                .tooltip("Stop (Escape)")
                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
         } else {
             Button::new("agent-send")
@@ -443,15 +703,57 @@ impl Render for AgentPanel {
                     .disabled(running)
                     .on_click(cx.listener(|this, _, _, cx| this.start(cx))),
             );
+        let about = match self.memory.outside() {
+            None => {
+                "The agent reads, searches and edits the notes in this vault, and nothing \
+                     outside it. Its edits are saved at once."
+            }
+            Some(_) => {
+                "An outside agent runs with its own tools, which can reach beyond the \
+                        vault. katib answers its file requests inside the vault only, and offers \
+                        it katib's note tools. Its edits are saved at once."
+            }
+        };
         let empty = self.rows.is_empty().then(|| {
             div()
                 .p_4()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child(
-                    "The agent reads, searches and edits the notes in this vault, and nothing \
-                     outside it. Its edits are saved at once.",
-                )
+                .child(about)
+        });
+        let queued = (!self.queued.is_empty()).then(|| {
+            v_flex()
+                .px_3()
+                .py_1()
+                .gap_1()
+                .border_t_1()
+                .border_color(theme.border)
+                .children(self.queued.iter().enumerate().map(|(ix, text)| {
+                    h_flex()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(format!("Queued: {text}")),
+                        )
+                        .child(
+                            Button::new(("agent-unqueue", ix))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip("Remove")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if ix < this.queued.len() {
+                                        this.queued.remove(ix);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                }))
         });
         v_flex()
             .size_full()
@@ -463,8 +765,17 @@ impl Render for AgentPanel {
                 Some(empty) => d.child(empty),
                 None => d.child(rows),
             }))
+            .children(queued)
             .child(
                 v_flex()
+                    // The input passes on an Escape it has no use for.
+                    .on_action(cx.listener(|this, _: &Escape, _, cx| {
+                        if this.running.is_some() {
+                            this.stop(cx);
+                        } else {
+                            cx.propagate();
+                        }
+                    }))
                     .p_2()
                     .gap_1()
                     .border_t_1()

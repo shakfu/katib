@@ -9,6 +9,7 @@ katib-core.workspace = true
 katib-editor.workspace = true
 katib-sync.workspace = true
 katib-agent.workspace = true
+katib-lsp.workspace = true
 # syntect: markdown highlighting in raw mode.
 gpui-kit = { workspace = true, features = ["syntect"] }
 notify = "8"

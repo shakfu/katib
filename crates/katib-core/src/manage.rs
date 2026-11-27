@@ -125,8 +125,9 @@ impl Plan {
 }
 
 /// Move (or rename) note `from` to id `to`, rewriting links. The index must be
-/// current; sync it afterwards.
+/// current; sync it afterwards. Waits while a sync cycle holds [`Vault::exclusive`].
 pub fn move_note(vault: &Vault, index: &Index, from: &str, to: &str) -> Result<Moved> {
+    let _exclusive = vault.exclusive();
     let Some((from, to, plan)) = plan_note(vault, index, from, to)? else {
         return Ok(Moved::default());
     };
@@ -148,6 +149,21 @@ pub fn preview_move_note(vault: &Vault, index: &Index, from: &str, to: &str) -> 
     match plan_note(vault, index, from, to)? {
         Some((_, _, plan)) => preview(vault, index, plan),
         None => Ok(Moved::default()),
+    }
+}
+
+/// The text changes [`move_note`] would make, refused for the same reasons, writing nothing:
+/// each note's text as read and as rewritten, by id, moving note included. For an editor that
+/// applies them itself, as an LSP rename does.
+pub fn move_note_edits(
+    vault: &Vault,
+    index: &Index,
+    from: &str,
+    to: &str,
+) -> Result<BTreeMap<String, (String, String)>> {
+    match plan_note(vault, index, from, to)? {
+        Some((_, _, plan)) => edits(vault, index, &plan),
+        None => Ok(BTreeMap::new()),
     }
 }
 
@@ -177,8 +193,10 @@ fn plan_note(
 }
 
 /// Move folder `from` (a vault path) to `to`, with every file in it, rewriting
-/// links to anything inside and the moved notes' own relative links.
+/// links to anything inside and the moved notes' own relative links. Waits as
+/// [`move_note`] does.
 pub fn move_folder(vault: &Vault, index: &Index, from: &str, to: &str) -> Result<Moved> {
+    let _exclusive = vault.exclusive();
     let (from_dir, to_dir, plan) = plan_folder(vault, index, from, to)?;
     let rewritten = write_edits(vault, &plan, edits(vault, index, &plan)?)?;
     if let Some(parent) = to_dir.parent() {
@@ -530,7 +548,7 @@ pub(crate) fn label_span(s: &str) -> Option<(usize, usize)> {
 /// The byte range of a markdown link's destination path (before any `#`) and
 /// its replacement. `None` for reference-style links, whose destination is on
 /// another line.
-fn destination_replacement(
+pub(crate) fn destination_replacement(
     text: &str,
     link: &Link,
     path: &str,
@@ -576,7 +594,7 @@ fn destination_replacement(
 
 /// The destination of the definition (`[ref]: path`) a reference-style link
 /// uses, and its replacement. Labels match ignoring case and runs of spaces.
-fn definition_replacement(
+pub(crate) fn definition_replacement(
     text: &str,
     link: &Link,
     path: &str,
@@ -718,6 +736,54 @@ mod tests {
 
     fn read(dir: &TempDir, p: &str) -> String {
         fs::read_to_string(dir.0.join(p)).unwrap()
+    }
+
+    #[test]
+    fn a_move_waits_while_the_vault_is_held() {
+        a_move_waits_for(false);
+    }
+
+    /// Another process holds its own `Vault`; only the file lock excludes it.
+    #[test]
+    fn a_move_waits_while_another_vault_of_the_folder_is_held() {
+        a_move_waits_for(true);
+    }
+
+    fn a_move_waits_for(separate: bool) {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let name = if separate {
+            "move-exclusive-2"
+        } else {
+            "move-exclusive"
+        };
+        let (_d, vault, index) = setup(name, &[("a.md", "x"), ("b.md", "[[a]]")]);
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let (held, is_held) = mpsc::channel();
+        let holder = {
+            let other = match separate {
+                true => Vault::open(vault.root()).unwrap(),
+                false => vault.clone(),
+            };
+            let (vault, released) = (other, released.clone());
+            std::thread::spawn(move || {
+                let _exclusive = vault.exclusive();
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                released.store(true, Ordering::SeqCst);
+            })
+        };
+        is_held.recv().unwrap();
+        move_note(&vault, &index, "a", "c").unwrap();
+        // The move could only start once the holder let go.
+        assert!(released.load(Ordering::SeqCst));
+        holder.join().unwrap();
+        assert_eq!(
+            fs::read_to_string(vault.root().join("b.md")).unwrap(),
+            "[[c]]"
+        );
     }
 
     #[test]

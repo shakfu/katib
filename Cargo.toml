@@ -5,6 +5,7 @@ members = [
     "crates/katib-editor",
     "crates/katib-sync",
     "crates/katib-agent",
+    "crates/katib-lsp",
     "crates/katib",
 ]
 
@@ -18,6 +19,7 @@ katib-core = { path = "crates/katib-core" }
 katib-editor = { path = "crates/katib-editor" }
 katib-sync = { path = "crates/katib-sync" }
 katib-agent = { path = "crates/katib-agent" }
+katib-lsp = { path = "crates/katib-lsp" }
 # Providers and the agent loop. To build against a minima checkout instead, add
 # `[patch.crates-io] minima-core = { path = "../minima/crates/minima-core" }`.
 minima-core = "0.7.1"

@@ -95,6 +95,8 @@ pub enum ExportError {
     Cancelled,
     /// An unknown `${name}` in the front matter.
     Variable(String),
+    /// A GitHub export refused to write to this folder, for the reason given.
+    Destination(PathBuf, &'static str),
 }
 
 impl fmt::Display for ExportError {
@@ -108,6 +110,7 @@ impl fmt::Display for ExportError {
             Self::TimedOut(d) => write!(f, "quarto took longer than {} s", d.as_secs()),
             Self::Cancelled => write!(f, "cancelled"),
             Self::Variable(e) => write!(f, "{e}"),
+            Self::Destination(p, why) => write!(f, "{} {why}", p.display()),
         }
     }
 }

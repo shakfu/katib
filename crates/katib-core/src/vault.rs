@@ -1,6 +1,7 @@
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use crate::note::{self, Note};
@@ -10,6 +11,8 @@ use crate::write::write_atomic;
 #[derive(Clone, Debug)]
 pub struct Vault {
     root: PathBuf,
+    /// See [`Vault::exclusive`]. Clones share it.
+    exclusive: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -34,6 +37,12 @@ impl fmt::Display for VaultError {
 
 impl std::error::Error for VaultError {}
 
+/// See [`Vault::exclusive`]. The file lock is released when the file closes.
+pub struct Exclusive<'a> {
+    _file: Option<fs::File>,
+    _held: MutexGuard<'a, ()>,
+}
+
 /// A note file: its id (path without `.md`, `/`-separated) and its path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -48,7 +57,41 @@ impl Vault {
         if !meta.is_dir() {
             return Err(VaultError::NotADirectory(root));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            exclusive: Arc::default(),
+        })
+    }
+
+    /// Held while several files change together (a move) or are committed (a sync cycle),
+    /// so a commit never holds half a move. Clones of one `Vault` share a mutex; other
+    /// processes, such as `katib mcp`, are excluded by a lock on `.katib/cache/lock`. Not
+    /// reentrant.
+    pub fn exclusive(&self) -> Exclusive<'_> {
+        // The lock guards no data, so a panic while it was held leaves nothing inconsistent.
+        let held = self
+            .exclusive
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Without the file lock (a read-only or unusual filesystem), processes go unexcluded;
+        // refusing every move there would be worse.
+        let file = self.lock_file().ok().filter(|f| f.lock().is_ok());
+        Exclusive {
+            _file: file,
+            _held: held,
+        }
+    }
+
+    fn lock_file(&self) -> Result<fs::File, VaultError> {
+        let dir = self.katib_dir()?.join("cache");
+        fs::create_dir_all(&dir).map_err(|e| VaultError::Io(dir.clone(), e))?;
+        let path = dir.join("lock");
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| VaultError::Io(path, e))
     }
 
     pub fn root(&self) -> &Path {
